@@ -995,8 +995,30 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct co
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
 	if (parm != NULL) {
+		struct location location;
+
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
+
+		/* subroutines which use DW_AT_abstract_origin to point at the original
+		 * function (and hence have no name in the DIE) specify locations for
+		 * each parameter; by seeing if a location specifies a register or not
+		 * we can figure out if a parameter was optimized out.
+		 */
+		if (!parm->name &&
+		    attr_location(die, &location.expr, &location.exprlen) == 0 &&
+		    location.exprlen != 0) {
+			Dwarf_Op *expr = location.expr;
+
+			switch (expr->atom) {
+			case DW_OP_reg1 ... DW_OP_reg31:
+			case DW_OP_breg0 ... DW_OP_breg31:
+				break;  
+			default:
+				parm->optimized = true;
+				break;
+			}
+		}
 	}
 
 	return parm;
@@ -2190,6 +2212,9 @@ static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu)
 			}
 			pos->name = tag__parameter(dtype->tag)->name;
 			pos->tag.type = dtype->tag->type;
+			if (pos->optimized) {
+				tag__parameter(dtype->tag)->optimized = pos->optimized;
+			}
 			continue;
 		}
 

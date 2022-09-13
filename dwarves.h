@@ -790,6 +790,7 @@ size_t lexblock__fprintf(const struct lexblock *lexblock, const struct cu *cu,
 struct parameter {
 	struct tag tag;
 	const char *name;
+	bool optimized;
 };
 
 static inline struct parameter *tag__parameter(const struct tag *tag)

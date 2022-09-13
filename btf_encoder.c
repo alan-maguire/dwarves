@@ -31,9 +31,22 @@
 #include <errno.h>
 #include <stdint.h>
 
+/* How many function parameters are passed via registers?  Used below in
+ * determining if an argument has been optimized out or if it is simply
+ * an argument > NR_REGISTER_PARAMS.
+ */
+#if defined(__x86_64__)
+#define NR_REGISTER_PARAMS	6
+#elif defined(__aarch64__)
+#define NR_REGISTER_PARAMS	8
+#else
+#define NR_REGISTER_PARAMS	0
+#endif
+
 struct elf_function {
 	const char	*name;
 	bool		 generated;
+	size_t		prefixlen;
 };
 
 #define MAX_PERCPU_VAR_CNT 4096
@@ -594,6 +607,11 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 	ftype__for_each_parameter(ftype, param) {
 		const char *name = parameter__name(param);
 
+		if (param->optimized && param_idx < NR_REGISTER_PARAMS) {
+			printf("skipping optimized param '%s' for func %d\n", name, id);
+			nr_params--;
+			continue;
+		}
 		type_id = param->tag.type == 0 ? 0 : type_id_off + param->tag.type;
 		++param_idx;
 		if (btf_encoder__add_func_param(encoder, name, type_id, param_idx == nr_params))
@@ -733,6 +751,8 @@ static int functions_cmp(const void *_a, const void *_b)
 	const struct elf_function *a = _a;
 	const struct elf_function *b = _b;
 
+	if (b->prefixlen && strlen(a->name) == b->prefixlen)
+		return strncmp(a->name, b->name, b->prefixlen);
 	return strcmp(a->name, b->name);
 }
 
@@ -765,6 +785,12 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 	}
 
 	encoder->functions.entries[encoder->functions.cnt].name = name;
+	if (strchr(name, '.')) {
+		const char *suffix = strchr(name, '.');
+
+		encoder->functions.entries[encoder->functions.cnt].prefixlen =
+			suffix - name;
+	}
 	encoder->functions.entries[encoder->functions.cnt].generated = false;
 	encoder->functions.cnt++;
 	return 0;
