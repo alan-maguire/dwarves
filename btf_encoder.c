@@ -58,7 +58,8 @@ struct btf_encoder {
 			  verbose,
 			  force,
 			  gen_floats,
-			  is_rel;
+			  is_rel,
+			  encode_optimized;
 	uint32_t	  array_index_id;
 	struct {
 		struct var_info vars[MAX_PERCPU_VAR_CNT];
@@ -565,7 +566,7 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 	ftype__for_each_parameter(ftype, param) {
 		const char *name = parameter__name(param);
 
-		if (param->optimized) {
+		if (encoder->encode_optimized && param->optimized) {
 			nr_params--;
 			continue;
 		}
@@ -1344,7 +1345,7 @@ out:
 	return err;
 }
 
-struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool skip_encoding_vars, bool force, bool gen_floats, bool verbose)
+struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, struct btf_encoder_opts *opts)
 {
 	struct btf_encoder *encoder = zalloc(sizeof(*encoder));
 
@@ -1358,10 +1359,11 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		if (encoder->btf == NULL)
 			goto out_delete;
 
-		encoder->force		 = force;
-		encoder->gen_floats	 = gen_floats;
-		encoder->skip_encoding_vars = skip_encoding_vars;
-		encoder->verbose	 = verbose;
+		encoder->force		 = opts->force;
+		encoder->gen_floats	 = opts->gen_floats;
+		encoder->skip_encoding_vars = opts->skip_encoding_vars;
+		encoder->verbose	 = opts->verbose;
+		encoder->encode_optimized = opts->encode_optimized;
 		encoder->has_index_type  = false;
 		encoder->need_index_type = false;
 		encoder->array_index_id  = 0;
@@ -1544,14 +1546,16 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu)
  			 * match is found; only bother if we found any
  			 * .suffix function names.
  			 */
-			if (!func && encoder->functions.suffix_cnt)
+			if (!func && encoder->encode_optimized &&
+			    encoder->functions.suffix_cnt)
 				func = btf_encoder__find_function(encoder, name,
 								  strlen(name));
 			if (!func || func->generated)
 				continue;
 			func->generated = true;
 			/* use symtab name as it may have optimization suffix */
-			name = func->name;
+			if (encoder->encode_optimized)
+				name = func->name;
 			if (fn->proto.optimized_parms)
 				printf("'%s' has optimized parameters\n", name);
 		} else {

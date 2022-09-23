@@ -39,6 +39,7 @@ static bool need_resort;
 static bool first_obj_only;
 static bool skip_encoding_btf_vars;
 static bool btf_encode_force;
+static bool btf_encode_optimized;
 static const char *base_btf_file;
 
 static const char *prettify_input_filename;
@@ -1220,6 +1221,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_compile		   334
 #define ARGP_languages		   335
 #define ARGP_languages_exclude	   336
+#define ARGP_btf_encode_optimized  337
 
 static const struct argp_option pahole__options[] = {
 	{
@@ -1623,6 +1625,11 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "Don't consider compilation units written in these languages"
 	},
 	{
+		.name = "btf_encode_optimized",
+		.key = ARGP_btf_encode_optimized,
+		.doc = "Encode optimized functions in BTF."
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -1787,6 +1794,8 @@ static error_t pahole__options_parser(int key, char *arg,
 		/* fallthru */
 	case ARGP_languages:
 		languages.str = arg;			break;
+	case ARGP_btf_encode_optimized:
+		btf_encode_optimized = true;		break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -3011,6 +3020,17 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 
 	if (btf_encode) {
 		static pthread_mutex_t btf_lock = PTHREAD_MUTEX_INITIALIZER;
+		struct btf_encoder_opts opts = {
+						.skip_encoding_vars =
+						 skip_encoding_btf_vars,
+						.force =
+						 btf_encode_force,
+						.gen_floats =
+						 btf_gen_floats,
+						.encode_optimized =
+						 btf_encode_optimized,
+						.verbose = global_verbose
+						};
 		struct btf_encoder *encoder;
 
 		pthread_mutex_lock(&btf_lock);
@@ -3026,8 +3046,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			 * And, it is used by the thread
 			 * create it.
 			 */
-			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, skip_encoding_btf_vars,
-						       btf_encode_force, btf_gen_floats, global_verbose);
+			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, &opts);
 			if (btf_encoder && thr_data) {
 				struct thread_data *thread = thr_data;
 
@@ -3055,11 +3074,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			if (thread->encoder == NULL) {
 				thread->encoder =
 					btf_encoder__new(cu, detached_btf_filename,
-							 NULL,
-							 skip_encoding_btf_vars,
-							 btf_encode_force,
-							 btf_gen_floats,
-							 global_verbose);
+							 NULL, &opts);
 				thread->btf = btf_encoder__btf(thread->encoder);
 			}
 			encoder = thread->encoder;
