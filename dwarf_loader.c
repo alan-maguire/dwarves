@@ -992,13 +992,67 @@ static struct class_member *class_member__new(Dwarf_Die *die, struct cu *cu,
 	return member;
 }
 
-static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
+/* How many function parameters are passed via registers?  Used below in
+ * determining if an argument has been optimized out or if it is simply
+ * an argument > NR_REGISTER_PARAMS.  Setting NR_REGISTER_PARAMS to 0
+ * allows unsupported architectures to skip tagging optimized-out
+ * values.
+ */
+#if defined(__x86_64__)
+#define NR_REGISTER_PARAMS      6
+#elif defined(__s390__)
+#define NR_REGISTER_PARAMS	5
+#elif defined(__aarch64__)
+#define NR_REGISTER_PARAMS      8
+#elif defined(__mips__)
+#define NR_REGISTER_PARAMS	8
+#elif defined(__powerpc__)
+#define NR_REGISTER_PARAMS	8
+#elif defined(__sparc__)
+#define NR_REGISTER_PARAMS	6
+#elif defined(__riscv) && __riscv_xlen == 64
+#define NR_REGISTER_PARAMS	8
+#elif defined(__arc__)
+#define NR_REGISTER_PARAMS	8
+#else
+#define NR_REGISTER_PARAMS      0
+#endif
+
+static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
+					struct conf_load *conf, int param_idx)
 {
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
 	if (parm != NULL) {
+		struct location loc;
+
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
+
+		/* Parameters which use DW_AT_abstract_origin to point at
+		 * the original parameter definition (with no name in the DIE)
+		 * are the result of later DWARF generation during compilation
+		 * so often better take into account if arguments were
+		 * optimized out.
+		 *
+		 * By checking that locations for parameters that are expected
+		 * to be passed as registers are actually passed as registers,
+		 * we can spot optimized-out parameters.
+		 */
+		if (param_idx < NR_REGISTER_PARAMS && !parm->name &&
+		    attr_location(die, &loc.expr, &loc.exprlen) == 0 &&
+		    loc.exprlen != 0) {
+			Dwarf_Op *expr = loc.expr;
+
+			switch (expr->atom) {
+			case DW_OP_reg1 ... DW_OP_reg31:
+			case DW_OP_breg0 ... DW_OP_breg31:
+				break;
+			default:
+				parm->optimized = true;
+				break;
+			}
+		}
 	}
 
 	return parm;
@@ -1450,7 +1504,7 @@ static struct tag *die__create_new_parameter(Dwarf_Die *die,
 					     struct cu *cu, struct conf_load *conf,
 					     int param_idx)
 {
-	struct parameter *parm = parameter__new(die, cu, conf);
+	struct parameter *parm = parameter__new(die, cu, conf, param_idx);
 
 	if (parm == NULL)
 		return NULL;
@@ -2209,6 +2263,10 @@ static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu)
 			}
 			pos->name = tag__parameter(dtype->tag)->name;
 			pos->tag.type = dtype->tag->type;
+			if (pos->optimized) {
+				tag__parameter(dtype->tag)->optimized = pos->optimized;
+				type->optimized_parms = 1;
+			}
 			continue;
 		}
 
@@ -2218,6 +2276,20 @@ static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu)
 			continue;
 		}
 		pos->tag.type = dtype->small_id;
+	}
+	/* if parameters were optimized out, set flag for the ftype this
+	 * function tag referred to via abstract origin.
+	 */
+	if (type->optimized_parms) {
+		struct dwarf_tag *dtype = type->tag.priv;
+		struct dwarf_tag *dftype;
+
+		dftype = dwarf_cu__find_tag_by_ref(dcu, &dtype->abstract_origin);
+		if (dftype && dftype->tag) {
+			struct ftype *ftype = tag__ftype(dftype->tag);
+
+			ftype->optimized_parms = 1;
+		}
 	}
 }
 
