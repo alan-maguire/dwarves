@@ -789,6 +789,7 @@ size_t lexblock__fprintf(const struct lexblock *lexblock, const struct cu *cu,
 struct parameter {
 	struct tag tag;
 	const char *name;
+	bool optimized;
 };
 
 static inline struct parameter *tag__parameter(const struct tag *tag)
@@ -808,7 +809,8 @@ struct ftype {
 	struct tag	 tag;
 	struct list_head parms;
 	uint16_t	 nr_parms;
-	uint8_t		 unspec_parms; /* just one bit is needed */
+	uint8_t		 unspec_parms:1; /* just one bit is needed */
+	uint8_t		 optimized_parms:1;
 };
 
 static inline struct ftype *tag__ftype(const struct tag *tag)
