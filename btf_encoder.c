@@ -34,6 +34,7 @@
 struct elf_function {
 	const char	*name;
 	bool		 generated;
+	size_t		prefixlen;
 };
 
 #define MAX_PERCPU_VAR_CNT 4096
@@ -70,6 +71,7 @@ struct btf_encoder {
 		struct elf_function *entries;
 		int		    allocated;
 		int		    cnt;
+		int		    suffix_cnt; /* number of .isra, .part etc */
 	} functions;
 };
 
@@ -563,6 +565,10 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 	ftype__for_each_parameter(ftype, param) {
 		const char *name = parameter__name(param);
 
+		if (param->optimized) {
+			nr_params--;
+			continue;
+		}
 		type_id = param->tag.type == 0 ? 0 : type_id_off + param->tag.type;
 		++param_idx;
 		if (btf_encoder__add_func_param(encoder, name, type_id, param_idx == nr_params))
@@ -702,6 +708,11 @@ static int functions_cmp(const void *_a, const void *_b)
 	const struct elf_function *a = _a;
 	const struct elf_function *b = _b;
 
+	/* if search key allows prefix match, verify target has matching
+	 * prefix len and prefix matches.
+	 */
+	if (a->prefixlen && a->prefixlen == b->prefixlen)
+			return strncmp(a->name, b->name, b->prefixlen);
 	return strcmp(a->name, b->name);
 }
 
@@ -734,14 +745,22 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 	}
 
 	encoder->functions.entries[encoder->functions.cnt].name = name;
+	if (strchr(name, '.')) {
+		const char *suffix = strchr(name, '.');
+
+		encoder->functions.suffix_cnt++;
+
+		encoder->functions.entries[encoder->functions.cnt].prefixlen =
+			suffix - name;
+	}
 	encoder->functions.entries[encoder->functions.cnt].generated = false;
 	encoder->functions.cnt++;
 	return 0;
 }
 
-static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder, const char *name)
+static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder, const char *name, size_t prefixlen)
 {
-	struct elf_function key = { .name = name };
+	struct elf_function key = { .name = name, .prefixlen = prefixlen };
 
 	return bsearch(&key, encoder->functions.entries, encoder->functions.cnt, sizeof(key), functions_cmp);
 }
@@ -1509,25 +1528,38 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu)
 			continue;
 		if (!ftype__has_arg_names(&fn->proto))
 			continue;
+		name = function__name(fn);
+
 		if (encoder->functions.cnt) {
 			struct elf_function *func;
-			const char *name;
 
-			name = function__name(fn);
 			if (!name)
 				continue;
 
-			func = btf_encoder__find_function(encoder, name);
+			/* prefer exact name function match... */
+			func = btf_encoder__find_function(encoder, name, 0);
+			if (func && func->generated)
+				continue;
+			/* but fall back to name.isra.0 match if no exact
+ 			 * match is found; only bother if we found any
+ 			 * .suffix function names.
+ 			 */
+			if (!func && encoder->functions.suffix_cnt)
+				func = btf_encoder__find_function(encoder, name,
+								  strlen(name));
 			if (!func || func->generated)
 				continue;
 			func->generated = true;
+			/* use symtab name as it may have optimization suffix */
+			name = func->name;
+			if (fn->proto.optimized_parms)
+				printf("'%s' has optimized parameters\n", name);
 		} else {
 			if (!fn->external)
 				continue;
 		}
 
 		btf_fnproto_id = btf_encoder__add_func_proto(encoder, &fn->proto, type_id_off);
-		name = function__name(fn);
 		btf_fn_id = btf_encoder__add_ref_type(encoder, BTF_KIND_FUNC, btf_fnproto_id, name, false);
 		if (btf_fnproto_id < 0 || btf_fn_id < 0) {
 			err = -1;
