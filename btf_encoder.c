@@ -1422,6 +1422,9 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		if (encoder->btf == NULL)
 			goto out_delete;
 
+		if (!base_btf)
+			btf__add_kinds(encoder->btf);
+
 		encoder->force		 = force;
 		encoder->gen_floats	 = gen_floats;
 		encoder->skip_encoding_vars = skip_encoding_vars;
