@@ -49,6 +49,7 @@ struct var_info {
  */
 struct btf_encoder {
 	struct list_head  node;
+	struct btf_encoder *parent;
 	struct btf        *btf;
 	struct cu         *cu;
 	struct gobuffer   percpu_secinfo;
@@ -1433,11 +1434,12 @@ out:
 	return err;
 }
 
-struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool skip_encoding_vars, bool force, bool gen_floats, bool verbose)
+struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool skip_encoding_vars, bool force, bool gen_floats, struct btf_encoder *parent, bool verbose)
 {
 	struct btf_encoder *encoder = zalloc(sizeof(*encoder));
 
 	if (encoder) {
+		encoder->parent = parent;
 		encoder->raw_output = detached_filename != NULL;
 		encoder->filename = strdup(encoder->raw_output ? detached_filename : cu->filename);
 		if (encoder->filename == NULL)

@@ -3037,7 +3037,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			 * create it.
 			 */
 			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, skip_encoding_btf_vars,
-						       btf_encode_force, btf_gen_floats, global_verbose);
+						       btf_encode_force, btf_gen_floats, NULL, global_verbose);
 			if (btf_encoder && thr_data) {
 				struct thread_data *thread = thr_data;
 
@@ -3069,6 +3069,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 							 skip_encoding_btf_vars,
 							 btf_encode_force,
 							 btf_gen_floats,
+							 btf_encoder,
 							 global_verbose);
 				thread->btf = btf_encoder__btf(thread->encoder);
 			}
