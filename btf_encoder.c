@@ -786,21 +786,39 @@ static int function__compare(const void *a, const void *b)
 	return strcmp(function__name(fa), function__name(fb));
 }
 
+#define BTF_ENCODER_MAX_PARAMETERS	10
+
 struct btf_encoder_state {
 	struct btf_encoder *encoder;
 	uint32_t type_id_off;
+	bool got_parameter_names;
+	const char *parameter_names[BTF_ENCODER_MAX_PARAMETERS];
 };
 
+void parameter_names__get(struct ftype *ftype, size_t nr_parameters, const char **parameter_names)
+{
+	struct parameter *parameter;
+	int i = 0;
+
+	ftype__for_each_parameter(ftype, parameter) {
+		if (i >= nr_parameters)
+			break;
+		parameter_names[i++] = parameter__name(parameter);
+	}
+}
+
 /*
- * static functions with suffixes are not added yet - we need to
- * observe across all CUs to see if the static function has
- * optimized parameters in any CU, since in such a case it should
- * not be included in the final BTF.  NF_HOOK.constprop.0() is
- * a case in point - it has optimized-out parameters in some CUs
- * but not others.  In order to have consistency (since we do not
- * know which instance the BTF-specified function signature will
- * apply to), we simply skip adding functions which have optimized
- * out parameters anywhere.
+ * static functions are not added yet - we need to observe across
+ * all CUs to see if the static function has optimized-out parameters
+ * in any CU, or inconsistent function prototypes; in either case,
+ * it should not be included in the final BTF.  For the optimized-out
+ * case, NF_HOOK.constprop.0() is a case in point - it has optimized-out
+ * parameters in some CUs but not others.  Similarly, a static function
+ * like enable_store() has inconsistent function prototypes in different
+ * CUs so should not be present.  In order to have consistency (since
+ * we do not know which instance the BTF-specified function signature
+ * will apply to), we simply skip adding functions which have
+ * optimized-out parameters/inconsistent function prototypes anywhere.
  */
 static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn)
 {
@@ -819,13 +837,51 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	}
 	/* If we find an existing entry, we want to merge observations
 	 * across both functions, checking that the "seen optimized-out
-	 * parameters" status is reflected in our tree entry.
+	 * parameters"/inconsistent proto status is reflected in tree entry.
 	 * If the entry is new, record encoder state required
 	 * to add the local function later (encoder + type_id_off)
-	 * such that we can add the function later.
+	 * such that we can add the function later.  Parameter names are
+	 * also stored in state to speed up multiple static function
+	 * comparisons.
 	 */
 	if (*nodep != fn) {
-		(*nodep)->proto.optimized_parms |= fn->proto.optimized_parms;
+		struct function *ofn = *nodep;
+
+		ofn->proto.optimized_parms |= fn->proto.optimized_parms;
+		/* compare parameters to see if signatures match */
+
+		if (ofn->proto.inconsistent_proto)
+			goto out;
+
+		if (ofn->proto.nr_parms != fn->proto.nr_parms) {
+			ofn->proto.inconsistent_proto = 1;
+			goto out;
+		}
+		if (ofn->proto.nr_parms > 0) {
+			struct btf_encoder_state *state = ofn->priv;
+			const char *parameter_names[BTF_ENCODER_MAX_PARAMETERS];
+			int i;
+
+			if (!state->got_parameter_names) {
+				parameter_names__get(&ofn->proto, BTF_ENCODER_MAX_PARAMETERS,
+						     state->parameter_names);
+				state->got_parameter_names = true;
+			}
+			parameter_names__get(&fn->proto, BTF_ENCODER_MAX_PARAMETERS,
+					     parameter_names);
+			for (i = 0; i < ofn->proto.nr_parms; i++) {
+				if (!state->parameter_names[i]) {
+					if (!parameter_names[i])
+						continue;
+				} else if (parameter_names[i]) {
+					if (strcmp(state->parameter_names[i],
+						   parameter_names[i]) == 0)
+						continue;
+				}
+				ofn->proto.inconsistent_proto = 1;
+				goto out;
+			}
+		}
 	} else {
 		struct btf_encoder_state *state = zalloc(sizeof(*state));
 
@@ -898,10 +954,12 @@ static void btf_encoder__add_saved_func(const void *nodep, const VISIT which,
 	/* we can safely free encoder state since we visit each node once */
 	free(fn->priv);
 	fn->priv = NULL;
-	if (fn->proto.optimized_parms) {
+	if (fn->proto.optimized_parms || fn->proto.inconsistent_proto) {
 		if (encoder->verbose)
-			printf("skipping addition of '%s' due to optimized-out parameters\n",
-			       function__name(fn));
+			printf("skipping addition of '%s' due to %s\n",
+			       function__name(fn),
+			       fn->proto.optimized_parms ? "optimized-out parameters" :
+			       				   "multiple inconsistent function prototypes");
 	} else {
 		btf_encoder__add_func(encoder, fn);
 	}
@@ -1775,6 +1833,8 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 		 */
 		if (fn->declaration)
 			continue;
+		if (!fn->external)
+			save = true;
 		if (!ftype__has_arg_names(&fn->proto))
 			continue;
 		if (encoder->functions.cnt) {
@@ -1790,7 +1850,8 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			if (func) {
 				if (func->generated)
 					continue;
-				func->generated = true;
+				if (!save)
+					func->generated = true;
 			} else if (encoder->functions.suffix_cnt) {
 				/* falling back to name.isra.0 match if no exact
 				 * match is found; only bother if we found any

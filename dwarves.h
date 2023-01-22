@@ -830,6 +830,7 @@ struct ftype {
 	uint16_t	 nr_parms;
 	uint8_t		 unspec_parms:1; /* just one bit is needed */
 	uint8_t		 optimized_parms:1;
+	uint8_t		 inconsistent_proto:1;
 };
 
 static inline struct ftype *tag__ftype(const struct tag *tag)
