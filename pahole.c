@@ -2991,20 +2991,20 @@ static int pahole_threads_collect(struct conf_load *conf, int nr_threads, void *
 		 * Merge content of the btf instances of worker threads to the btf
 		 * instance of the primary btf_encoder.
                 */
-		if (!threads[i]->btf || threads[i]->encoder == btf_encoder)
-			continue; /* The primary btf_encoder */
+		if (!threads[i]->btf)
+			continue;
 		err = btf_encoder__add_encoder(btf_encoder, threads[i]->encoder);
 		if (err < 0)
 			goto out;
-		btf_encoder__delete(threads[i]->encoder);
-		threads[i]->encoder = NULL;
 	}
 	err = 0;
 
 out:
 	for (i = 0; i < nr_threads; i++) {
-		if (threads[i]->encoder && threads[i]->encoder != btf_encoder)
+		if (threads[i]->encoder && threads[i]->encoder != btf_encoder) {
 			btf_encoder__delete(threads[i]->encoder);
+			threads[i]->encoder = NULL;
+		}
 	}
 	free(threads[0]);
 
@@ -3088,11 +3088,11 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			encoder = btf_encoder;
 		}
 
-		if (btf_encoder__encode_cu(encoder, cu, conf_load)) {
+		ret = btf_encoder__encode_cu(encoder, cu, conf_load);
+		if (ret < 0) {
 			fprintf(stderr, "Encountered error while encoding BTF.\n");
 			exit(1);
 		}
-		ret = LSK__DELETE;
 out_btf:
 		return ret;
 	}

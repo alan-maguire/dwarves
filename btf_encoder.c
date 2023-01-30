@@ -30,11 +30,13 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <search.h> /* for tsearch(), tfind() and tdestroy() */
 #include <pthread.h>
 
 struct elf_function {
 	const char	*name;
 	bool		 generated;
+	size_t		prefixlen;
 };
 
 #define MAX_PERCPU_VAR_CNT 4096
@@ -57,6 +59,8 @@ struct btf_encoder {
 	struct elf_symtab *symtab;
 	uint32_t	  type_id_off;
 	uint32_t	  unspecified_type;
+	void		  *saved_func_tree;
+	int		  saved_func_cnt;
 	bool		  has_index_type,
 			  need_index_type,
 			  skip_encoding_vars,
@@ -77,11 +81,14 @@ struct btf_encoder {
 		struct elf_function *entries;
 		int		    allocated;
 		int		    cnt;
+		int		    suffix_cnt; /* number of .isra, .part etc */
 	} functions;
 };
 
 static LIST_HEAD(encoders);
 static pthread_mutex_t encoders__lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void btf_encoder__add_saved_funcs(struct btf_encoder *encoder);
 
 /* mutex only needed for add/delete, as this can happen in multiple encoding
  * threads.  Traversal of the list is currently confined to thread collection.
@@ -707,6 +714,10 @@ int32_t btf_encoder__add_encoder(struct btf_encoder *encoder, struct btf_encoder
 	int32_t i, id;
 	struct btf_var_secinfo *vsi;
 
+	btf_encoder__add_saved_funcs(other);
+	if (encoder == other)
+		return 0;
+
 	for (i = 0; i < nr_var_secinfo; i++) {
 		vsi = (struct btf_var_secinfo *)var_secinfo_buf->entries + i;
 		type_id = next_type_id + vsi->type - 1; /* Type ID starts from 1 */
@@ -782,6 +793,70 @@ static int32_t btf_encoder__add_decl_tag(struct btf_encoder *encoder, const char
 	return id;
 }
 
+
+static int function__compare(const void *a, const void *b)
+{
+	struct function *fa = (struct function *)a, *fb = (struct function *)b;
+
+	return strcmp(function__name(fa), function__name(fb));
+}
+
+struct btf_encoder_state {
+	struct btf_encoder *encoder;
+	uint32_t type_id_off;
+};
+
+static void btf_encoder__merge_func(struct btf_encoder *encoder, struct function *fn)
+{
+	struct function **nodep;
+
+	nodep = tfind(fn, &encoder->saved_func_tree, function__compare);
+	if (!nodep || !*nodep)
+		return;
+	/* merge characteristics across different encoder representations
+	 * of functions.
+	 */
+	fn->proto.optimized_parms |= (*nodep)->proto.optimized_parms;
+	(*nodep)->proto.optimized_parms |= fn->proto.optimized_parms;
+	(*nodep)->proto.processed = 1;
+}
+
+static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn)
+{
+	const char *name = function__name(fn);
+	struct function **nodep;
+
+	nodep = tsearch(fn, &encoder->saved_func_tree, function__compare);
+	if (nodep == NULL) {
+		fprintf(stderr, "error: out of memory adding static function '%s'\n",
+			name);
+		return -1;
+	}
+	/* If saving and we find an existing entry, we want to merge
+	 * observations across both functions, checking that the
+	 * "seen optimized parameters" status is reflected in our tree entry.
+	 * If the entry is new, record encoder state required
+	 * to add the local function later (encoder + type_id_off)
+	 * such that we can add the function later.
+	 */
+	if (*nodep != fn) {
+		(*nodep)->proto.optimized_parms |= fn->proto.optimized_parms;
+	} else {
+		struct btf_encoder_state *state = zalloc(sizeof(*state));
+
+		if (state == NULL) {
+			fprintf(stderr, "error: out of memory adding local function '%s'\n",
+				name);
+			return -1;
+		}
+		state->encoder = encoder;
+		state->type_id_off = encoder->type_id_off;
+		fn->priv = state;
+		encoder->saved_func_cnt++;
+	}
+	return 0;
+}
+
 static int32_t btf_encoder__add_func(struct btf_encoder *encoder, struct function *fn)
 {
 	int btf_fnproto_id, btf_fn_id, tag_type_id;
@@ -807,6 +882,67 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder, struct functio
 	return 0;
 }
 
+/* visit each node once, adding associated function. */
+static void btf_encoder__add_saved_func(const void *nodep, const VISIT which,
+					const int depth __maybe_unused)
+{
+	struct btf_encoder *encoder, *other_encoder;
+	struct btf_encoder_state *state;
+	struct function *fn = NULL;
+
+	switch (which) {
+	case preorder:
+	case endorder:
+		break;
+	case postorder:
+	case leaf:
+		fn = *((struct function **)nodep);
+		break;
+	}
+	if (!fn || !fn->priv || fn->proto.processed)
+		return;
+	state = (struct btf_encoder_state *)fn->priv;
+	encoder = state->encoder;
+	encoder->type_id_off = state->type_id_off;
+
+	/* merge optimized-out status across encoders */
+	btf_encoders__for_each_encoder(other_encoder) {
+		if (other_encoder != encoder)
+			btf_encoder__merge_func(other_encoder, fn);
+	}
+
+	if (fn->proto.optimized_parms) {
+		if (encoder->verbose) {
+			const char *name = function__name(fn);
+
+			printf("skipping addition of '%s'(%s) due to optimized-out parameters\n",
+			       name, fn->alias ?: name);
+		}
+	} else {
+		btf_encoder__add_func(encoder, fn);
+		fn->proto.processed = 1;
+	}
+}
+
+static void saved_func__free(void *node)
+{
+	struct function *fn = node;
+
+	if (fn->priv)
+		free(fn->priv);
+}
+
+void btf_encoder__add_saved_funcs(struct btf_encoder *encoder)
+{
+	if (!encoder->saved_func_tree)
+		return;
+
+	encoder->type_id_off = 0;
+	twalk(encoder->saved_func_tree, btf_encoder__add_saved_func);
+	tdestroy(encoder->saved_func_tree, saved_func__free);
+	encoder->saved_func_tree = NULL;
+}
+
 /*
  * This corresponds to the same macro defined in
  * include/linux/kallsyms.h
@@ -818,6 +954,11 @@ static int functions_cmp(const void *_a, const void *_b)
 	const struct elf_function *a = _a;
 	const struct elf_function *b = _b;
 
+	/* if search key allows prefix match, verify target has matching
+	 * prefix len and prefix matches.
+	 */
+	if (a->prefixlen && a->prefixlen == b->prefixlen)
+		return strncmp(a->name, b->name, b->prefixlen);
 	return strcmp(a->name, b->name);
 }
 
@@ -850,14 +991,21 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 	}
 
 	encoder->functions.entries[encoder->functions.cnt].name = name;
+	if (strchr(name, '.')) {
+		const char *suffix = strchr(name, '.');
+
+		encoder->functions.suffix_cnt++;
+		encoder->functions.entries[encoder->functions.cnt].prefixlen = suffix - name;
+	}
 	encoder->functions.entries[encoder->functions.cnt].generated = false;
 	encoder->functions.cnt++;
 	return 0;
 }
 
-static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder, const char *name)
+static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder,
+						       const char *name, size_t prefixlen)
 {
-	struct elf_function key = { .name = name };
+	struct elf_function key = { .name = name, .prefixlen = prefixlen };
 
 	return bsearch(&key, encoder->functions.entries, encoder->functions.cnt, sizeof(key), functions_cmp);
 }
@@ -1186,6 +1334,9 @@ out:
 int btf_encoder__encode(struct btf_encoder *encoder)
 {
 	int err;
+
+	/* for single-threaded case, saved funcs are added here */
+	btf_encoder__add_saved_funcs(encoder);
 
 	if (gobuffer__size(&encoder->percpu_secinfo) != 0)
 		btf_encoder__add_datasec(encoder, PERCPU_SECTION);
@@ -1634,6 +1785,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	}
 
 	cu__for_each_function(cu, core_id, fn) {
+		bool save = false;
 
 		/*
 		 * Skip functions that:
@@ -1654,22 +1806,55 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			if (!name)
 				continue;
 
-			func = btf_encoder__find_function(encoder, name);
-			if (!func || func->generated)
+			/* prefer exact function name match... */
+			func = btf_encoder__find_function(encoder, name, 0);
+			if (func) {
+				if (func->generated)
+					continue;
+				func->generated = true;
+			} else if (encoder->functions.suffix_cnt) {
+				/* falling back to name.isra.0 match if no exact
+				 * match is found; only bother if we found any
+				 * .suffix function names.  The function
+				 * will be saved and added once we ensure
+				 * it does not have optimized-out parameters
+				 * in any cu.
+				 */
+				func = btf_encoder__find_function(encoder, name,
+								  strlen(name));
+				if (func) {
+					save = true;
+					if (encoder->verbose)
+						printf("matched function '%s' with '%s'%s\n",
+						       name, func->name,
+						       fn->proto.optimized_parms ?
+						       ", has optimized-out parameters" : "");
+				}
+			}
+			if (!func)
 				continue;
-			func->generated = true;
+			fn->alias = func->name;
 		} else {
 			if (!fn->external)
 				continue;
 		}
 
-		err = btf_encoder__add_func(encoder, fn);
+		if (save)
+			err = btf_encoder__save_func(encoder, fn);
+		else
+			err = btf_encoder__add_func(encoder, fn);
 		if (err)
 			goto out;
 	}
 
 	if (!encoder->skip_encoding_vars)
 		err = btf_encoder__encode_cu_variables(encoder);
+
+	/* It is only safe to delete this CU if we have not stashed any static
+	 * functions for later addition.
+	 */
+	if (!err)
+		err = encoder->saved_func_cnt > 0 ? LSK__KEEPIT : LSK__DELETE;
 out:
 	encoder->cu = NULL;
 	return err;
