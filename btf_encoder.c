@@ -1883,7 +1883,8 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			if (func) {
 				if (func->generated)
 					continue;
-				func->generated = true;
+				if (!conf_load->skip_encoding_btf_inconsistent_proto)
+					func->generated = true;
 			}
 			if (!func && encoder->functions.suffix_cnt) {
 				/* falling back to name.isra.0 match if no exact
@@ -1912,7 +1913,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 				continue;
 		}
 
-		if (save)
+		if (save || conf_load->skip_encoding_btf_inconsistent_proto)
 			err = btf_encoder__save_func(encoder, fn);
 		else
 			err = btf_encoder__add_func(encoder, fn);

@@ -1230,6 +1230,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_languages_exclude	   336
 #define ARGP_skip_encoding_btf_enum64 337
 #define ARGP_skip_emitting_atomic_typedefs 338
+#define ARGP_skip_encoding_btf_inconsistent_proto 339
 
 static const struct argp_option pahole__options[] = {
 	{
@@ -1643,6 +1644,11 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "Do not emit 'typedef _Atomic int atomic_int' & friends."
 	},
 	{
+		.name = "skip_encoding_btf_inconsistent_proto",
+		.key = ARGP_skip_encoding_btf_inconsistent_proto,
+		.doc = "Skip functions that have multiple inconsistent function prototypes sharing the same name, or have optimized-out parameters",
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -1813,6 +1819,8 @@ static error_t pahole__options_parser(int key, char *arg,
 		conf_load.skip_encoding_btf_enum64 = true;	break;
 	case ARGP_skip_emitting_atomic_typedefs:
 		conf.skip_emitting_atomic_typedefs = true;	break;
+	case ARGP_skip_encoding_btf_inconsistent_proto:
+		conf_load.skip_encoding_btf_inconsistent_proto = true;	break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
