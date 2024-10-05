@@ -92,6 +92,7 @@ struct conf_load {
 	bool			btf_gen_optimized;
 	bool			skip_encoding_btf_inconsistent_proto;
 	bool			skip_encoding_btf_vars;
+	bool			encode_btf_global_vars;
 	bool			btf_gen_floats;
 	bool			btf_encode_force;
 	bool			reproducible_build;
@@ -1411,6 +1412,8 @@ struct class {
 	uint8_t		 pre_bit_hole;
 	uint8_t		 bit_padding;
 	bool		 holes_searched;
+	bool		 flexible_array_verified;
+	bool		 has_flexible_array;
 	bool		 is_packed;
 	void		 *priv;
 };
@@ -1453,6 +1456,7 @@ static inline int class__is_struct(const struct class *cls)
 	return tag__is_struct(&cls->type.namespace.tag);
 }
 
+bool class__has_flexible_array(struct class *class, struct cu *cu);
 void class__find_holes(struct class *cls);
 int class__has_hole_ge(const struct class *cls, const uint16_t size);
 

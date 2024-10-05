@@ -1575,6 +1575,39 @@ void lexblock__add_label(struct lexblock *block, struct label *label)
 	lexblock__add_tag(block, &label->ip.tag);
 }
 
+static bool __class__has_flexible_array(struct class *class, struct cu *cu)
+{
+	struct class_member *member = type__last_member(&class->type);
+
+	if (member == NULL)
+		return false;
+
+	struct tag *type = cu__type(cu, member->tag.type);
+
+	if (type->tag != DW_TAG_array_type)
+		return false;
+
+	struct array_type *array = tag__array_type(type);
+
+	if (array->dimensions > 1)
+		return false;
+
+	if (array->nr_entries == NULL || array->nr_entries[0] == 0)
+		return true;
+
+	return false;
+}
+
+bool class__has_flexible_array(struct class *class, struct cu *cu)
+{
+	if (!class->flexible_array_verified) {
+		class->has_flexible_array = __class__has_flexible_array(class, cu);
+		class->flexible_array_verified = true;
+	}
+
+	return class->has_flexible_array;
+}
+
 const struct class_member *class__find_bit_hole(const struct class *class,
 					    const struct class_member *trailer,
 						const uint16_t bit_hole_size)
