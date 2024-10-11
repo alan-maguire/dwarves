@@ -1575,7 +1575,7 @@ void lexblock__add_label(struct lexblock *block, struct label *label)
 	lexblock__add_tag(block, &label->ip.tag);
 }
 
-static bool __class__has_flexible_array(struct class *class, struct cu *cu)
+static bool __class__has_flexible_array(struct class *class, const struct cu *cu)
 {
 	struct class_member *member = type__last_member(&class->type);
 
@@ -1598,7 +1598,7 @@ static bool __class__has_flexible_array(struct class *class, struct cu *cu)
 	return false;
 }
 
-bool class__has_flexible_array(struct class *class, struct cu *cu)
+bool class__has_flexible_array(struct class *class, const struct cu *cu)
 {
 	if (!class->flexible_array_verified) {
 		class->has_flexible_array = __class__has_flexible_array(class, cu);
@@ -1735,6 +1735,50 @@ void class__find_holes(struct class *class)
 	class->padding = ctype->size - last_seen_bit / 8;
 
 	class->holes_searched = true;
+}
+
+bool class__has_embedded_flexible_array(struct class *cls, const struct cu *cu)
+{
+	struct type *ctype = &cls->type;
+	struct class_member *pos;
+
+	if (!tag__is_struct(class__tag(cls)))
+		return false;
+
+	if (cls->embedded_flexible_array_searched)
+		return cls->has_embedded_flexible_array;
+
+	type__for_each_member(ctype, pos) {
+		/* XXX for now just skip these */
+		if (pos->tag.tag == DW_TAG_inheritance &&
+		    pos->virtuality == DW_VIRTUALITY_virtual)
+			continue;
+
+		if (pos->is_static)
+			continue;
+
+		struct tag *member_type = tag__strip_typedefs_and_modifiers(&pos->tag, cu);
+		if (member_type == NULL)
+			continue;
+
+		if (!tag__is_struct(member_type))
+			continue;
+
+		cls->has_embedded_flexible_array = class__has_flexible_array(tag__class(member_type), cu);
+		if (cls->has_embedded_flexible_array)
+			break;
+
+		if (member_type == class__tag(cls))
+			continue;
+
+		cls->has_embedded_flexible_array = class__has_embedded_flexible_array(tag__class(member_type), cu);
+		if (cls->has_embedded_flexible_array)
+			break;
+	}
+
+	cls->embedded_flexible_array_searched = true;
+
+	return cls->has_embedded_flexible_array;
 }
 
 static size_t type__natural_alignment(struct type *type, const struct cu *cu);
