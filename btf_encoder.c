@@ -88,6 +88,7 @@ struct btf_encoder_func_state {
 struct elf_function {
 	const char	*name;
 	char		*alias;
+	uint32_t	addr;
 	size_t		prefixlen;
 	struct btf_encoder_func_state state;
 };
@@ -131,6 +132,7 @@ struct btf_encoder {
 		int		    allocated;
 		int		    cnt;
 		int		    suffix_cnt; /* number of .isra, .part etc */
+		uint64_t	    base_addr;
 	} functions;
 };
 
@@ -1274,13 +1276,23 @@ static int functions_cmp(const void *_a, const void *_b)
 {
 	const struct elf_function *a = _a;
 	const struct elf_function *b = _b;
+	int ret;
 
 	/* if search key allows prefix match, verify target has matching
 	 * prefix len and prefix matches.
 	 */
 	if (a->prefixlen && a->prefixlen == b->prefixlen)
-		return strncmp(a->name, b->name, b->prefixlen);
-	return strcmp(a->name, b->name);
+		ret = strncmp(a->name, b->name, b->prefixlen);
+	else
+		ret = strcmp(a->name, b->name);
+	if (ret != 0)
+		return ret;
+	/* avoid address mismatch */
+        if (a->addr != 0 && b->addr != 0) {
+                if (a->addr != b->addr)
+                        return a->addr > b->addr ? 1 : -1;
+        }
+	return 0;
 }
 
 #ifndef max
@@ -1301,6 +1313,7 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 {
 	struct elf_function *new;
 	const char *name;
+	uint64_t addr;
 
 	if (elf_sym__type(sym) != STT_FUNC)
 		return 0;
@@ -1325,6 +1338,9 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 	memset(&encoder->functions.entries[encoder->functions.cnt], 0,
 	       sizeof(*new));
 	encoder->functions.entries[encoder->functions.cnt].name = name;
+	/* convert to absoulte address for DWARF/ELF matching. */
+	addr = elf_sym__value(sym);
+	encoder->functions.entries[encoder->functions.cnt].addr = (uint32_t)addr;
 	if (strchr(name, '.')) {
 		const char *suffix = strchr(name, '.');
 
@@ -1336,9 +1352,10 @@ static int btf_encoder__collect_function(struct btf_encoder *encoder, GElf_Sym *
 }
 
 static struct elf_function *btf_encoder__find_function(const struct btf_encoder *encoder,
-						       const char *name, size_t prefixlen)
+						       const char *name, size_t prefixlen,
+						       uint32_t addr)
 {
-	struct elf_function key = { .name = name, .prefixlen = prefixlen };
+	struct elf_function key = { .name = name, .prefixlen = prefixlen, .addr = addr };
 
 	return bsearch(&key, encoder->functions.entries, encoder->functions.cnt, sizeof(key), functions_cmp);
 }
@@ -2086,11 +2103,16 @@ int btf_encoder__encode(struct btf_encoder *encoder)
 
 static int btf_encoder__collect_symbols(struct btf_encoder *encoder)
 {
+	bool base_addr_set = false;
 	uint32_t sym_sec_idx;
 	uint32_t core_id;
 	GElf_Sym sym;
 
 	elf_symtab__for_each_symbol_index(encoder->symtab, core_id, sym, sym_sec_idx) {
+		if (!base_addr_set && sym_sec_idx && sym_sec_idx < encoder->seccnt) {
+			encoder->functions.base_addr = encoder->secinfo[sym_sec_idx].addr;
+			base_addr_set = true;
+		}
 		if (btf_encoder__collect_function(encoder, &sym))
 			return -1;
 	}
@@ -2543,13 +2565,16 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 			continue;
 		if (encoder->functions.cnt) {
 			const char *name;
+			uint64_t addr;
 
 			name = function__name(fn);
 			if (!name)
 				continue;
 
+			addr = (uint32_t)function__addr(fn);
+
 			/* prefer exact function name match... */
-			func = btf_encoder__find_function(encoder, name, 0);
+			func = btf_encoder__find_function(encoder, name, 0, addr);
 			if (!func && encoder->functions.suffix_cnt &&
 			    conf_load->btf_gen_optimized) {
 				/* falling back to name.isra.0 match if no exact
@@ -2560,7 +2585,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 				 * in any cu.
 				 */
 				func = btf_encoder__find_function(encoder, name,
-								  strlen(name));
+								  strlen(name), addr);
 				if (func) {
 					if (encoder->verbose)
 						printf("matched function '%s' with '%s'%s\n",
