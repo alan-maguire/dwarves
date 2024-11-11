@@ -21,6 +21,9 @@ echo -n "Parallel reproducible DWARF Loading/Serial BTF encoding: "
 
 test -n "$VERBOSE" && printf "\nserial encoding...\n"
 
+# This will make pahole and pfunct to skip rust CUs
+export PAHOLE_LANG_EXCLUDE=rust
+
 pahole --btf_features=default --btf_encode_detached=$outdir/vmlinux.btf.serial $vmlinux
 bpftool btf dump file $outdir/vmlinux.btf.serial > $outdir/bpftool.output.vmlinux.btf.serial
 

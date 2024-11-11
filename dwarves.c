@@ -2506,6 +2506,102 @@ int lang__str2int(const char *lang)
 	return -1;
 }
 
+static int lang_id_cmp(const void *pa, const void *pb)
+{
+	int a = *(int *)pa,
+	    b = *(int *)pb;
+	return a - b;
+}
+
+int languages__parse(struct languages *languages, const char *tool)
+{
+	int nr_allocated = 4;
+	char *lang = languages->str;
+
+	languages->entries = zalloc(sizeof(int) * nr_allocated);
+	if (languages->entries == NULL)
+		goto out_enomem;
+
+	while (1) {
+		char *sep = strchr(lang, ',');
+
+		if (sep)
+			*sep = '\0';
+
+		int id = lang__str2int(lang);
+
+		if (sep)
+			*sep = ',';
+
+		if (id < 0) {
+			fprintf(stderr, "%s: unknown language \"%s\"\n", tool, lang);
+			goto out_free;
+		}
+
+		if (languages->nr_entries >= nr_allocated) {
+			nr_allocated *= 2;
+			int *entries = realloc(languages->entries, nr_allocated);
+
+			if (entries == NULL)
+				goto out_enomem;
+
+			languages->entries = entries;
+		}
+
+		languages->entries[languages->nr_entries++] = id;
+
+		if (!sep)
+			break;
+
+		lang = sep + 1;
+	}
+
+	qsort(languages->entries, languages->nr_entries, sizeof(int), lang_id_cmp);
+
+	return 0;
+out_enomem:
+	fprintf(stderr, "%s: not enough memory to parse --lang\n", tool);
+out_free:
+	zfree(&languages->entries);
+	languages->nr_entries = 0;
+	return -1;
+}
+
+bool languages__in(struct languages *languages, int lang)
+{
+	return bsearch(&lang, languages->entries, languages->nr_entries, sizeof(int), lang_id_cmp) != NULL;
+}
+
+int languages__init(struct languages *languages, const char *tool)
+{
+	if (languages->str == NULL) { // use PAHOLE_ as the namespace for all these tools
+		languages->str = getenv("PAHOLE_LANG_EXCLUDE");
+
+		if (languages->str == NULL)
+			return 0;
+
+		languages->exclude = true;
+	}
+
+	return languages__parse(languages, tool);
+}
+
+bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool verbose)
+{
+	if (languages->nr_entries == 0)
+		return false;
+
+	bool in = languages__in(languages, cu->language);
+
+	if ((!in && !languages->exclude) ||
+	    (in && languages->exclude)) {
+		if (verbose)
+			printf("Filtering CU %s written in %s.\n", cu->name, lang__int2str(cu->language));
+		return true;
+	}
+
+	return false;
+}
 
 static int sysfs__read_build_id(const char *filename, void *build_id, size_t size)
 {
@@ -2743,6 +2839,23 @@ static int vmlinux_path__add(const char *new_entry)
 	return 0;
 }
 
+static int vmlinux_path__add_debuginfod_client(void)
+{
+	const char *home_dir = getenv("HOME");
+	if (home_dir == NULL)
+		return -1;
+
+	char running_sbuild_id[SBUILD_ID_SIZE];
+
+	if (sysfs__sprintf_build_id(NULL, running_sbuild_id) < 0)
+		return -1;
+
+	char bf[PATH_MAX];
+	snprintf(bf, sizeof(bf), "%s/.cache/debuginfod_client/%s/debuginfo", home_dir, running_sbuild_id);
+
+	return vmlinux_path__add(bf);
+}
+
 static int vmlinux_path__init(void)
 {
 	struct utsname uts;
@@ -2750,8 +2863,9 @@ static int vmlinux_path__init(void)
 	char *kernel_version;
 	unsigned int i;
 
+	// Add 1 for the debuginfod client HOME based cache
 	vmlinux_path = malloc(sizeof(char *) * (ARRAY_SIZE(vmlinux_paths) +
-			      ARRAY_SIZE(vmlinux_paths_upd)));
+						ARRAY_SIZE(vmlinux_paths_upd) + 1));
 	if (vmlinux_path == NULL)
 		return -1;
 
@@ -2769,6 +2883,8 @@ static int vmlinux_path__init(void)
 		if (vmlinux_path__add(bf) < 0)
 			goto out_fail;
 	}
+
+	vmlinux_path__add_debuginfod_client();
 
 	return 0;
 
