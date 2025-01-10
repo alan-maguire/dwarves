@@ -44,12 +44,6 @@ enum load_steal_kind {
 	LSK__STOP_LOADING,
 };
 
-enum cu_state {
-	CU__UNPROCESSED,
-	CU__LOADED,
-	CU__PROCESSING,
-};
-
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
  * like a allyesconfig vmlinux kernel we can get over 65535 types.
@@ -60,7 +54,6 @@ struct btf;
 struct conf_fprintf;
 
 /** struct conf_load - load configuration
- * @thread_exit - called at the end of a thread, 1st user: BTF encoder dedup
  * @extra_dbg_info - keep original debugging format extra info
  *		     (e.g. DWARF's decl_{line,file}, id, etc)
  * @fixup_silly_bitfields - Fixup silly things such as "int foo:32;"
@@ -70,11 +63,8 @@ struct conf_fprintf;
  * @skip_missing - skip missing types rather than bailing out.
  */
 struct conf_load {
-	enum load_steal_kind	(*steal)(struct cu *cu,
-					 struct conf_load *conf,
-					 void *thr_data);
+	enum load_steal_kind	(*steal)(struct cu *cu, struct conf_load *conf);
 	struct cu *		(*early_cu_filter)(struct cu *cu);
-	int			(*thread_exit)(struct conf_load *conf, void *thr_data);
 	void			*cookie;
 	char			*format_path;
 	int			nr_jobs;
@@ -105,8 +95,6 @@ struct conf_load {
 	const char		*kabi_prefix;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
-	int			(*threads_prepare)(struct conf_load *conf, int nr_threads, void **thr_data);
-	int			(*threads_collect)(struct conf_load *conf, int nr_threads, void **thr_data, int error);
 };
 
 /** struct conf_fprintf - hints to the __fprintf routines
@@ -187,10 +175,6 @@ void cus__add(struct cus *cus, struct cu *cu);
 
 void __cus__remove(struct cus *cus, struct cu *cu);
 void cus__remove(struct cus *cus, struct cu *cu);
-
-struct cu *cus__get_next_processable_cu(struct cus *cus);
-
-void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state);
 
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
@@ -290,6 +274,7 @@ struct cu {
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
 	struct rb_root	 functions;
+	uint32_t	 id;
 	const char	 *name;
 	char		 *filename;
 	void 		 *priv;
@@ -307,7 +292,6 @@ struct cu {
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
-	enum cu_state	 state;
 	uint16_t	 language;
 	unsigned long	 nr_inline_expansions;
 	size_t		 size_inline_expansions;
@@ -516,10 +500,16 @@ int cu__for_all_tags(struct cu *cu,
 				     struct cu *cu, void *cookie),
 		     void *cookie);
 
+struct attributes {
+	uint64_t cnt;
+	const char *values[];
+};
+
 /** struct tag - basic representation of a debug info element
  * @priv - extra data, for instance, DWARF offset, id, decl_{file,line}
  * @top_level -
  * @shared_tags: used by struct namespace
+ * @attributes - attributes specified by BTF_DECL_TAGs targeting this tag
  */
 struct tag {
 	struct list_head node;
@@ -530,7 +520,7 @@ struct tag {
 	bool		 has_btf_type_tag:1;
 	bool		 shared_tags:1;
 	uint8_t		 recursivity_level;
-	const char	 *attribute;
+	struct attributes *attributes;
 };
 
 // To use with things like type->type_enum == perf_event_type+perf_user_event_type
@@ -1627,6 +1617,8 @@ void dwarves__exit(void);
 void dwarves__resolve_cacheline_size(const struct conf_load *conf, uint16_t user_cacheline_size);
 
 const char *dwarf_tag_name(const uint32_t tag);
+
+const char *vmlinux_path__btf_filename(void);
 
 const char *vmlinux_path__find_running_kernel(void);
 

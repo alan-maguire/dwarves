@@ -210,6 +210,9 @@ void tag__delete(struct tag *tag, struct cu *cu)
 
 	assert(list_empty(&tag->node));
 
+	if (tag->attributes)
+		free(tag->attributes);
+
 	switch (tag->tag) {
 	case DW_TAG_union_type:
 		type__delete(tag__type(tag), cu);		break;
@@ -530,48 +533,6 @@ void cus__unlock(struct cus *cus)
 	pthread_mutex_unlock(&cus->mutex);
 }
 
-void cus__set_cu_state(struct cus *cus, struct cu *cu, enum cu_state state)
-{
-	cus__lock(cus);
-	cu->state = state;
-	cus__unlock(cus);
-}
-
-// Used only when reproducible builds are desired
-struct cu *cus__get_next_processable_cu(struct cus *cus)
-{
-	struct cu *cu;
-
-	cus__lock(cus);
-
-	list_for_each_entry(cu, &cus->cus, node) {
-		switch (cu->state) {
-		case CU__LOADED:
-			cu->state = CU__PROCESSING;
-			goto found;
-		case CU__PROCESSING:
-			// This will happen when we get to parallel
-			// reproducible BTF encoding, libbpf dedup work needed
-			// here. The other possibility is when we're flushing
-			// the DWARF processed CUs when the parallel DWARF
-			// loading stoped and we still have CUs to encode to
-			// BTF because of ordering requirements.
-			continue;
-		case CU__UNPROCESSED:
-			// The first entry isn't loaded, signal the
-			// caller to return and try another day, as we
-			// need to respect the original DWARF CU ordering.
-			goto out;
-		}
-	}
-out:
-	cu = NULL;
-found:
-	cus__unlock(cus);
-
-	return cu;
-}
-
 bool cus__empty(const struct cus *cus)
 {
 	return list_empty(&cus->cus);
@@ -764,6 +725,8 @@ int cu__fprintf_ptr_table_stats_csv(struct cu *cu, FILE *fp)
 	return printed;
 }
 
+#define OBSTACK_CHUNK_SIZE (128*1024)
+
 struct cu *cu__new(const char *name, uint8_t addr_size,
 		   const unsigned char *build_id, int build_id_len,
 		   const char *filename, bool use_obstack)
@@ -775,7 +738,10 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 
 		cu->use_obstack = use_obstack;
 		if (cu->use_obstack)
-			obstack_init(&cu->obstack);
+			obstack_begin(&cu->obstack, OBSTACK_CHUNK_SIZE);
+
+		if (name == NULL || filename == NULL)
+			goto out_free;
 
 		cu->name = strdup(name);
 		if (cu->name == NULL)
@@ -804,8 +770,6 @@ struct cu *cu__new(const char *name, uint8_t addr_size,
 
 		cu->addr_size = addr_size;
 		cu->extra_dbg_info = 0;
-
-		cu->state = CU__UNPROCESSED;
 
 		cu->nr_inline_expansions   = 0;
 		cu->size_inline_expansions = 0;
@@ -2807,6 +2771,19 @@ static int filename__sprintf_build_id(const char *pathname, char *sbuild_id)
 static int vmlinux_path__nr_entries;
 static char **vmlinux_path;
 
+const char *vmlinux_path__btf_filename(void)
+{
+	static const char *vmlinux_btf;
+
+	if (vmlinux_btf == NULL) {
+		vmlinux_btf = getenv("PAHOLE_VMLINUX_BTF_FILENAME");
+		if (vmlinux_btf == NULL)
+			vmlinux_btf = "/sys/kernel/btf/vmlinux";
+	}
+
+	return vmlinux_btf;
+}
+
 static void vmlinux_path__exit(void)
 {
 	while (--vmlinux_path__nr_entries >= 0)
@@ -2931,9 +2908,17 @@ const char *vmlinux_path__find_running_kernel(void)
 static int cus__load_running_kernel(struct cus *cus, struct conf_load *conf)
 {
 	int err = 0;
+	bool btf_only = false;
 
-	if ((!conf || conf->format_path == NULL || strncmp(conf->format_path, "btf", 3) == 0) &&
-	    access("/sys/kernel/btf/vmlinux", R_OK) == 0) {
+	if (!conf || conf->format_path == NULL)
+		goto try_btf;
+
+	if (!strstr(conf->format_path, "btf"))
+		goto try_elf;
+
+	btf_only = strcmp(conf->format_path, "btf") == 0;
+try_btf:
+	if (access(vmlinux_path__btf_filename(), R_OK) == 0) {
 		int loader = debugging_formats__loader("btf");
 		if (loader == -1)
 			goto try_elf;
@@ -2941,10 +2926,13 @@ static int cus__load_running_kernel(struct cus *cus, struct conf_load *conf)
 		if (conf && conf->conf_fprintf)
 			conf->conf_fprintf->has_alignment_info = debug_fmt_table[loader]->has_alignment_info;
 
-		if (debug_fmt_table[loader]->load_file(cus, conf, "/sys/kernel/btf/vmlinux") == 0)
+		if (debug_fmt_table[loader]->load_file(cus, conf, vmlinux_path__btf_filename()) == 0)
 			return 0;
 	}
 try_elf:
+	if (btf_only)
+		return -1;
+
 	elf_version(EV_CURRENT);
 	vmlinux_path__init();
 
