@@ -1,0 +1,94 @@
+name: 'Build kernel run selftests via vmtest'
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: true
+        default: 'ubuntu-24.04'
+        type: string
+      arch:
+        description: 'what arch to test'
+        required: true
+        default: 'x86_64'
+        type: string
+      kernel:
+        description: 'kernel version or LATEST'
+        required: true
+        default: 'LATEST'
+        type: string
+      pahole:
+        description: 'pahole rev or branch'
+        required: false
+        default: 'master'
+        type: string
+      llvm-version:
+        description: 'llvm version'
+        required: false
+        default: '18'
+        type: string
+jobs:
+  vmtest:
+    name: pahole@${{ inputs.arch }}
+    runs-on: ${{ inputs.runs_on }}
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: libbpf/ci/setup-build-env@v3
+        with:
+          pahole: ${{ inputs.pahole }}
+          arch: ${{ inputs.arch }}
+          llvm-version: ${{ inputs.llvm-version }}
+
+      - name: Build,install current pahole
+        shell: bash
+        run: |
+          git config --global --add safe.directory ${{ github.workspace }}
+          git submodule update --init
+          mkdir build
+          cd build
+          cmake -DGIT_SUBMODULE=OFF -DBUILD_SHARED_LIBS=OFF ..
+          make -j$((4*$(nproc))) all
+          make DESTDIR=../install install
+
+      - name: Get kernel source
+        uses: libbpf/ci/get-linux-source@v3
+        with:
+          repo: 'https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git'
+          dest: '${{ github.workspace }}/.kernel'
+
+      - name: Configure, build kernel with current pahole
+        shell: bash
+        run: |
+          export PATH=${{ github.workspace }}/install/usr/local/bin:${PATH}
+          export PAHOLE=${{ github.workspace }}/install/usr/local/bin/pahole
+          which pahole
+          $PAHOLE --version
+          cd .kernel
+          cat tools/testing/selftests/bpf/config \
+              tools/testing/selftests/bpf/config.${{ inputs.arch }} > .config
+          # this file might or might not exist depending on kernel version
+          cat tools/testing/selftests/bpf/config.vm >> .config || :
+          make olddefconfig && make prepare
+          grep PAHOLE .config
+          grep _BTF .config
+          make -j $((4*$(nproc))) all
+          cp vmlinux ${{ github.workspace }}
+          cd -
+
+      - name: Run selftests
+        env:
+          VMLINUX: ${{ github.workspace }}/vmlinux
+          LLVM_VERSION: ${{ inputs.llvm-version }}
+          SELFTESTS: ${{ github.workspace }}/tests
+        shell: bash
+        run: |
+           cd $SELFTESTS
+           export PATH=${{ github.workspace }}/install/usr/local/bin:${PATH}
+           which pahole
+           pahole --version
+           vmlinux=$VMLINUX ./tests
+           cd -
+
