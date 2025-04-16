@@ -1656,6 +1656,15 @@ static struct inline_expansion *inline_expansion__new(Dwarf_Die *die, struct cu 
 		dtag->decl_file = attr_string(die, DW_AT_call_file, conf);
 		dtag->decl_line = attr_numeric(die, DW_AT_call_line);
 		dwarf_tag__set_attr_type(dtag, type, die, DW_AT_abstract_origin);
+
+		Dwarf_Attribute attr_orig;
+		if (dwarf_attr(die, DW_AT_abstract_origin, &attr_orig)) {
+			Dwarf_Die die_orig;
+			if (dwarf_formref_die(&attr_orig, &die_orig)) {
+				exp->name = attr_string(&die_orig, DW_AT_name, conf);
+			}
+		}
+
 		exp->ip.addr = 0;
 		exp->high_pc = 0;
 		exp->nr_parms = 0;
@@ -3005,6 +3014,33 @@ static void __tag__print_abstract_origin_not_found(struct tag *tag,
 #define tag__print_abstract_origin_not_found(tag) \
 	__tag__print_abstract_origin_not_found(tag, __func__, __LINE__)
 
+static void function__recode_dwarf_name(struct tag *tag, struct cu *cu)
+{
+	struct function *fn = tag__function(tag);
+	struct dwarf_tag *dtag = tag__dwarf(tag);
+	struct dwarf_tag *dtype;
+
+	if (fn->name != 0)
+		return;
+	if (dtag->abstract_origin == 0 && dtag->specification == 0)
+		return;
+
+	dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
+	if (dtype == NULL)
+		dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
+	if (dtype != NULL)
+		fn->name = tag__function(dtag__tag(dtype))->name;
+	else {
+		fprintf(stderr,
+			"%s: couldn't find name for "
+			"function %#llx, abstract_origin=%#llx,"
+			" specification=%#llx\n", __func__,
+			(unsigned long long)dtag->id,
+			(unsigned long long)dtag->abstract_origin,
+			(unsigned long long)dtag->specification);
+	}
+}
+
 static void parameter__share_state_with_abstract_origin(struct parameter *parm,
 							struct parameter *oparm)
 {
@@ -3100,6 +3136,7 @@ static void inline_expansion__recode_dwarf_types(struct tag *tag, struct cu *cu)
 	struct dwarf_cu *dcu = cu->priv;
 	struct dwarf_tag *dtag = tag__dwarf(tag);
 	struct dwarf_tag *dtype;
+	struct tag *origin;
 	struct tag *pos;
 
 	/*
@@ -3118,7 +3155,12 @@ static void inline_expansion__recode_dwarf_types(struct tag *tag, struct cu *cu)
 		return;
 	}
 
-	ftype__recode_dwarf_types(dtag__tag(dtype), cu);
+	origin = dtag__tag(dtype);
+	if (tag__is_function(origin)) {
+		function__recode_dwarf_name(origin, cu);
+		tag__inline_expansion(tag)->name = function__name(tag__function(origin));
+	}
+	ftype__recode_dwarf_types(origin, cu);
 
 	list_for_each_entry(pos, &tag__inline_expansion(tag)->parms, node)
 		parameter__recode_dwarf_type(tag__parameter(pos), cu, NULL);
@@ -3462,20 +3504,7 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 				 */
 				return 0;
 			}
-			dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
-			if (dtype == NULL)
-				dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
-			if (dtype != NULL)
-				fn->name = tag__function(dtag__tag(dtype))->name;
-			else {
-				fprintf(stderr,
-					"%s: couldn't find name for "
-					"function %#llx, abstract_origin=%#llx,"
-					" specification=%#llx\n", __func__,
-					(unsigned long long)dtag->id,
-					(unsigned long long)dtag->abstract_origin,
-					(unsigned long long)dtag->specification);
-			}
+			function__recode_dwarf_name(tag, cu);
 		}
 		lexblock__recode_dwarf_types(&fn->lexblock, cu);
 	}
