@@ -1519,6 +1519,17 @@ static struct function *function__new(Dwarf_Die *die, struct cu *cu, struct conf
 		func->vtable_entry    = -1;
 		if (dwarf_hasattr(die, DW_AT_vtable_elem_location))
 			func->vtable_entry = attr_offset(die, DW_AT_vtable_elem_location);
+		/* some functions will have entry address in the start address
+		 * in DW_AT_ranges.
+		 */
+		if (dwarf_hasattr(die, DW_AT_ranges)) {
+			Dwarf_Addr base, start, high_pc;
+			ptrdiff_t offset = 0;
+
+			dwarf_ranges(die, offset, &base, &start, &high_pc);
+			if (start)
+				func->addr = (uint64_t)start;
+		}
 		func->cu_total_size_inline_expansions = 0;
 		func->cu_total_nr_inline_expansions = 0;
 		func->priv = NULL;
@@ -2789,7 +2800,7 @@ static void dwarf_cu__recode_btf_type_tag_ptr(struct btf_type_tag_ptr_type *tag,
 static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 {
 	struct dwarf_tag *dtag = tag__dwarf(tag);
-	struct dwarf_tag *dtype;
+	struct dwarf_tag *dtype = NULL;
 
 	/* Check if this is an already recoded bitfield */
 	if (dtag == NULL)
@@ -2805,22 +2816,35 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 	case DW_TAG_subprogram: {
 		struct function *fn = tag__function(tag);
 
-		if (fn->name == 0)  {
+		if (fn->name == 0 || function__addr(fn) == 0) {
 			if (dtag->abstract_origin == 0 &&
 			    dtag->specification == 0) {
-				/*
-				 * Found on libQtGui.so.4.3.4.debug
-				 *  <3><1423de>: Abbrev Number: 209 (DW_TAG_subprogram)
-				 *      <1423e0>   DW_AT_declaration : 1
-				 */
-				return 0;
+				if (fn->name == 0) {
+					/*
+					 * Found on libQtGui.so.4.3.4.debug
+					 *  <3><1423de>: Abbrev Number: 209 (DW_TAG_subprogram)
+					 *      <1423e0>   DW_AT_declaration : 1
+					 */
+					return 0;
+				}
+			} else {
+				dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
+				if (dtype == NULL)
+					dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
 			}
-			dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
-			if (dtype == NULL)
-				dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
-			if (dtype != NULL)
-				fn->name = tag__function(dtag__tag(dtype))->name;
-			else {
+			if (dtype != NULL) {
+				struct function *dfn = tag__function(dtag__tag(dtype));
+				if (fn->name == 0)
+					fn->name = dfn->name;
+				/* share function address info between tag and
+				 * abstract origin.
+				 */
+				if (!function__addr(fn))
+					fn->addr = function__addr(dfn);
+				else if (!function__addr(dfn))
+					dfn->addr = function__addr(fn);
+			}
+			if (fn->name == 0) {
 				fprintf(stderr,
 					"%s: couldn't find name for "
 					"function %#llx, abstract_origin=%#llx,"
