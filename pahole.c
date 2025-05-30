@@ -1152,6 +1152,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARG_padding_ge		   347
 #define ARG_padding		   348
 #define ARGP_with_embedded_flexible_array 349
+#define ARGP_btf_attributes	   350
 
 /* --btf_features=feature1[,feature2,..] allows us to specify
  * a list of requested BTF features or "default" to enable all default
@@ -1182,10 +1183,31 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
  * floats, etc.  This ensures backwards compatibility.
  */
 #define BTF_DEFAULT_FEATURE(name, alias, initial_value)		\
-	{ #name, #alias, &conf_load.alias, initial_value, true }
+	{ #name, #alias, &conf_load.alias, initial_value, true, NULL }
+
+#define BTF_DEFAULT_FEATURE_CHECK(name, alias, initial_value, feature_check)	\
+	{ #name, #alias, &conf_load.alias, initial_value, true, feature_check }
 
 #define BTF_NON_DEFAULT_FEATURE(name, alias, initial_value)	\
-	{ #name, #alias, &conf_load.alias, initial_value, false }
+	{ #name, #alias, &conf_load.alias, initial_value, false, NULL }
+
+#define BTF_NON_DEFAULT_FEATURE_CHECK(name, alias, initial_value, feature_check) \
+	{ #name, #alias, &conf_load.alias, initial_value, false, feature_check }
+
+static bool enum64_check(void)
+{
+	return btf__add_enum64 != NULL;
+}
+
+static bool distilled_base_check(void)
+{
+	return btf__distill_base != NULL;
+}
+
+static bool attributes_check(void)
+{
+	return btf__add_type_attr != NULL;
+}
 
 struct btf_feature {
 	const char      *name;
@@ -1195,21 +1217,23 @@ struct btf_feature {
 	bool		default_enabled;	/* some nonstandard features may not
 						 * be enabled for --btf_features=default
 						 */
+	bool		(*feature_check)(void);
 } btf_features[] = {
 	BTF_DEFAULT_FEATURE(encode_force, btf_encode_force, false),
 	BTF_DEFAULT_FEATURE(var, skip_encoding_btf_vars, true),
 	BTF_DEFAULT_FEATURE(float, btf_gen_floats, false),
 	BTF_DEFAULT_FEATURE(decl_tag, skip_encoding_btf_decl_tag, true),
 	BTF_DEFAULT_FEATURE(type_tag, skip_encoding_btf_type_tag, true),
-	BTF_DEFAULT_FEATURE(enum64, skip_encoding_btf_enum64, true),
+	BTF_DEFAULT_FEATURE_CHECK(enum64, skip_encoding_btf_enum64, true, enum64_check),
 	BTF_DEFAULT_FEATURE(optimized_func, btf_gen_optimized, false),
 	BTF_DEFAULT_FEATURE(consistent_func, skip_encoding_btf_inconsistent_proto, false),
 	BTF_DEFAULT_FEATURE(decl_tag_kfuncs, btf_decl_tag_kfuncs, false),
 	BTF_NON_DEFAULT_FEATURE(reproducible_build, reproducible_build, false),
-#if LIBBPF_MAJOR_VERSION >= 1 && LIBBPF_MINOR_VERSION >= 5
-	BTF_NON_DEFAULT_FEATURE(distilled_base, btf_gen_distilled_base, false),
-#endif
+	BTF_NON_DEFAULT_FEATURE_CHECK(distilled_base, btf_gen_distilled_base, false,
+				      distilled_base_check),
 	BTF_NON_DEFAULT_FEATURE(global_var, encode_btf_global_vars, false),
+	BTF_NON_DEFAULT_FEATURE_CHECK(attributes, btf_attributes, false,
+				      attributes_check),
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -1248,7 +1272,8 @@ static void enable_btf_feature(struct btf_feature *feature)
 	/* switch "initial-off" features on, and "initial-on" features
 	 * off; i.e. negate the initial value.
 	 */
-	*feature->conf_value = !feature->initial_value;
+	if (!feature->feature_check || feature->feature_check())
+		*feature->conf_value = !feature->initial_value;
 }
 
 static void show_supported_btf_features(FILE *output)
@@ -1256,6 +1281,8 @@ static void show_supported_btf_features(FILE *output)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
+		if (btf_features[i].feature_check && !btf_features[i].feature_check())
+			continue;
 		if (i > 0)
 			fprintf(output, ",");
 		fprintf(output, "%s", btf_features[i].name);
@@ -1436,7 +1463,7 @@ static const struct argp_option pahole__options[] = {
 	{
 		.name = "with_embedded_flexible_array",
 		.key  = ARGP_with_embedded_flexible_array,
-		.doc  = "show only structs with an embedded flexible array (contaning a struct that has a flexible array)",
+		.doc  = "show only structs with an embedded flexible array (containing a struct that has a flexible array)",
 	},
 	{
 		.name = "expand_types",
@@ -1786,6 +1813,11 @@ static const struct argp_option pahole__options[] = {
 		.doc = "Search for, possibly getting from a debuginfo server, a vmlinux matching the running kernel build-id (from /sys/kernel/notes)"
 	},
 	{
+		.name = "btf_attributes",
+		.key  = ARGP_btf_attributes,
+		.doc  = "Allow generation of attributes in BTF. Attributes are the type tags and decl tags with the kind_flag set to 1.",
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -1979,6 +2011,8 @@ static error_t pahole__options_parser(int key, char *arg,
 		show_supported_btf_features(stdout);	exit(0);
 	case ARGP_btf_features_strict:
 		parse_btf_features(arg, true);		break;
+	case ARGP_btf_attributes:
+		conf_load.btf_attributes = true;	break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -3492,6 +3526,14 @@ int main(int argc, char *argv[])
 		argp_help(&pahole__argp, stderr, ARGP_HELP_SEE, argv[0]);
 		goto out;
 	}
+
+	// Right now encoding BTF has to be from DWARF, so enforce that, otherwise
+	// the loading process can fall back to other formats, BTF being the case
+	// and as this is at this point unintended, avoid that.
+	// Next we need to just skip object files that don't have the format we
+	// expect as the source for BTF encoding, i.e. no DWARF, no BTF, no problema.
+	if (btf_encode && conf_load.format_path == NULL)
+		conf_load.format_path = "dwarf";
 
 	if (show_running_kernel_vmlinux) {
 		const char *vmlinux = vmlinux_path__find_running_kernel();
