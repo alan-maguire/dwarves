@@ -326,7 +326,7 @@ static int function__emit_type_definitions(struct function *func,
 					   struct cu *cu, FILE *fp)
 {
 	struct parameter *pos;
-	struct ftype *proto = func->btf ? tag__ftype(cu__type(cu, func->proto.tag.type)) : &func->proto;
+	struct ftype *proto = &func->proto;
 	struct tag *type = cu__type(cu, proto->tag.type);
 
 retry_return_type:
