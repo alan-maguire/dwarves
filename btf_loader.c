@@ -84,6 +84,8 @@ out_free_parameters:
 static int create_new_function(struct cu *cu, const struct btf_type *tp, uint32_t id)
 {
 	struct function *func = tag__alloc(sizeof(*func));
+	struct btf *btf = cu->priv;
+	const struct btf_type *t;
 
 	if (func == NULL)
 		return -ENOMEM;
@@ -95,7 +97,9 @@ static int create_new_function(struct cu *cu, const struct btf_type *tp, uint32_
 	func->proto.tag.type = tp->type;
 	func->name = cu__btf_str(cu, tp->name_off);
 	INIT_LIST_HEAD(&func->lexblock.tags);
-	cu__add_tag_with_id(cu, &func->proto.tag, id);
+	INIT_LIST_HEAD(&func->annots);
+	t = btf__type_by_id(btf, tp->type);
+	cu__load_ftype(cu, &func->proto, DW_TAG_subprogram, t, id);
 
 	return 0;
 }
@@ -124,6 +128,7 @@ static void type__init(struct type *type, uint32_t tag, const char *name, size_t
 	type->size = size;
 	type->namespace.tag.tag = tag;
 	type->namespace.name = name;
+	INIT_LIST_HEAD(&type->namespace.annots);
 	type->template_parameter_pack = NULL;
 }
 
