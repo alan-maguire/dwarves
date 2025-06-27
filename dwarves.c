@@ -811,6 +811,10 @@ void cu__delete(struct cu *cu)
 
 	zfree(&cu->filename);
 	zfree(&cu->name);
+	if (cu->fd >= 0 && cu->elf) {
+		elf_end(cu->elf);
+		close(cu->fd);
+	}
 	free(cu);
 }
 

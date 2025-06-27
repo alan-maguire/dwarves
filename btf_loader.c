@@ -59,18 +59,17 @@ static int cu__load_ftype(struct cu *cu, struct ftype *proto, uint32_t tag, cons
 	proto->formal_parameter_pack = NULL;
 
 	for (i = 0; i < vlen; ++i, param++) {
+		struct parameter *p = tag__alloc(sizeof(*p));
+
 		if (param->type == 0)
 			proto->unspec_parms = 1;
-		else {
-			struct parameter *p = tag__alloc(sizeof(*p));
 
-			if (p == NULL)
-				goto out_free_parameters;
-			p->tag.tag  = DW_TAG_formal_parameter;
-			p->tag.type = param->type;
-			p->name	    = cu__btf_str(cu, param->name_off);
-			ftype__add_parameter(proto, p);
-		}
+		if (p == NULL)
+			goto out_free_parameters;
+		p->tag.tag  = DW_TAG_formal_parameter;
+		p->tag.type = param->type;
+		p->name	    = cu__btf_str(cu, param->name_off);
+		ftype__add_parameter(proto, p);
 	}
 
 	cu__add_tag_with_id(cu, &proto->tag, id);
@@ -84,6 +83,8 @@ out_free_parameters:
 static int create_new_function(struct cu *cu, const struct btf_type *tp, uint32_t id)
 {
 	struct function *func = tag__alloc(sizeof(*func));
+	struct btf *btf = cu->priv;
+	const struct btf_type *t;
 
 	if (func == NULL)
 		return -ENOMEM;
@@ -95,7 +96,9 @@ static int create_new_function(struct cu *cu, const struct btf_type *tp, uint32_
 	func->proto.tag.type = tp->type;
 	func->name = cu__btf_str(cu, tp->name_off);
 	INIT_LIST_HEAD(&func->lexblock.tags);
-	cu__add_tag_with_id(cu, &func->proto.tag, id);
+	INIT_LIST_HEAD(&func->annots);
+	t = btf__type_by_id(btf, tp->type);
+	cu__load_ftype(cu, &func->proto, DW_TAG_subprogram, t, tp->type);
 
 	return 0;
 }
@@ -124,6 +127,7 @@ static void type__init(struct type *type, uint32_t tag, const char *name, size_t
 	type->size = size;
 	type->namespace.tag.tag = tag;
 	type->namespace.name = name;
+	INIT_LIST_HEAD(&type->namespace.annots);
 	type->template_parameter_pack = NULL;
 }
 
@@ -723,6 +727,23 @@ static int cus__load_btf(struct cus *cus, struct conf_load *conf, const char *fi
 	cu->language = LANG_C;
 	cu->uses_global_strings = false;
 	cu->dfops = &btf__ops;
+
+	/* Need ELF information for BTF encoding also */
+	if (conf->btf_encode) {
+		cu->fd = open(filename, O_RDONLY), err = -1;
+		if (cu->fd >= 0) {
+			if (elf_version(EV_CURRENT) == EV_NONE) {
+				fprintf(stderr, "%s: cannot set libelf version.\n", __func__);
+				goto out_free;
+			}
+			cu->elf = elf_begin(cu->fd, ELF_C_READ_MMAP, NULL);
+			if (cu->elf == NULL) {
+				fprintf(stderr, "%s: cannot read %s ELF file.\n",
+					__func__, filename);
+				goto out_free;
+			}
+		}
+        }
 
 	libbpf_set_print(libbpf_log);
 

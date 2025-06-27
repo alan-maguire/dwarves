@@ -289,6 +289,7 @@ struct cu {
 	uint32_t	 id;
 	const char	 *name;
 	char		 *filename;
+	int		 fd;
 	void 		 *priv;
 	struct debug_fmt_ops *dfops;
 	Elf		 *elf;
