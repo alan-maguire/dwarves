@@ -87,6 +87,7 @@ struct conf_load {
 	bool			ignore_inline_expansions;
 	bool			ignore_labels;
 	bool			ptr_table_stats;
+	bool			btf_encode;
 	bool			skip_encoding_btf_decl_tag;
 	bool			skip_missing;
 	bool			skip_encoding_btf_type_tag;
