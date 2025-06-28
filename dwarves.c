@@ -2952,17 +2952,27 @@ try_elf:
 int cus__load_files(struct cus *cus, struct conf_load *conf,
 		    char *filenames[])
 {
-	int i = 0;
+	int i = 0, loaded = 0, failed = 0;
 
 	while (filenames[i] != NULL) {
 		int err = cus__load_file(cus, conf, filenames[i]);
 		if (err) {
 			errno = -err;
-			return -++i;
+			if (conf->btf_encode_force)
+				failed = -(i + 1);
+			else
+				return -++i;
+		} else {
+			loaded++;
 		}
 		++i;
 	}
 
+	if (conf->btf_encode_force) {
+		/* If no files loaded, error out, otherwise return success */
+		if (loaded == 0)
+			return failed;
+	}
 	return i ? 0 : cus__load_running_kernel(cus, conf);
 }
 
