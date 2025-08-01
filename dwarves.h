@@ -1082,6 +1082,7 @@ struct function {
 	const char	 *name;
 	const char	 *linkage_name;
 	const char	 *alias;	/* name.isra.0 */
+	uint64_t	 addr;
 	uint32_t	 cu_total_size_inline_expansions;
 	uint16_t	 cu_total_nr_inline_expansions;
 	uint8_t		 inlined:2;
@@ -1147,7 +1148,7 @@ const char *function__prototype_conf(const struct function *func,
 
 static __pure inline uint64_t function__addr(const struct function *func)
 {
-	return func->lexblock.ip.addr;
+	return func->lexblock.ip.addr ?: func->addr;
 }
 
 static __pure inline uint32_t function__size(const struct function *func)
