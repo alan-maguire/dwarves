@@ -1519,6 +1519,17 @@ static struct function *function__new(Dwarf_Die *die, struct cu *cu, struct conf
 		func->vtable_entry    = -1;
 		if (dwarf_hasattr(die, DW_AT_vtable_elem_location))
 			func->vtable_entry = attr_offset(die, DW_AT_vtable_elem_location);
+		/* some functions will have entry address in the start address
+		 * in DW_AT_ranges.
+		 */
+		if (dwarf_hasattr(die, DW_AT_ranges)) {
+			Dwarf_Addr base, start, high_pc;
+			ptrdiff_t offset = 0;
+
+			dwarf_ranges(die, offset, &base, &start, &high_pc);
+			if (start)
+				func->addr = (uint64_t)start;
+		}
 		func->cu_total_size_inline_expansions = 0;
 		func->cu_total_nr_inline_expansions = 0;
 		func->priv = NULL;
