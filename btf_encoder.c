@@ -1231,9 +1231,26 @@ static bool elf_function__has_ambiguous_address(struct elf_function *func)
 	return false;
 }
 
+static bool elf_function__is_non_fn(struct elf_function *func, uint64_t addr)
+{
+	struct elf_function_sym *sym;
+	int i;
+
+	/* no address info available */
+	if (!addr)
+		return false;
+
+	for (i = 0; i < func->sym_cnt; i++) {
+		sym = &func->syms[i];
+		if (sym->non_fn && addr == sym->addr)
+			return true;
+	}
+	return false;
+}
+
 static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn, struct elf_function *func)
 {
-	struct btf_encoder_func_state *state = btf_encoder__alloc_func_state(encoder);
+	struct btf_encoder_func_state *state;
 	struct ftype *ftype = &fn->proto;
 	struct btf *btf = encoder->btf;
 	struct llvm_annotation *annot;
@@ -1241,6 +1258,17 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	uint8_t param_idx = 0;
 	int str_off, err = 0;
 
+	/* Debug information may have been supplied for non-functions like
+	 * foo.part.0 or foo.cold.0.  Such cases can confuse our inconsistent
+	 * function detection because the function signature may not match
+	 * that of the real function.  To avoid such confusions, try to match
+	 * DWARF (with name foo) with the associated ELF (foo.part.0) via
+	 * address; this allows us to skip saving such functions.
+	 */
+	if (elf_function__is_non_fn(func, function__addr(fn)))
+		return 0;
+
+	state = btf_encoder__alloc_func_state(encoder);
 	if (!state)
 		return -ENOMEM;
 
