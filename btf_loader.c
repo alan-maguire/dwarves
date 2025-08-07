@@ -735,7 +735,7 @@ struct debug_fmt_ops btf__ops;
 
 static int cus__load_btf(struct cus *cus, struct conf_load *conf, const char *filename)
 {
-	int err = -1;
+	int fd = -1, err = -1;
 
 	// Pass a zero for addr_size, we'll get it after we load via btf__pointer_size()
 	struct cu *cu = cu__new(filename, 0, NULL, 0, filename, false);
@@ -745,6 +745,23 @@ static int cus__load_btf(struct cus *cus, struct conf_load *conf, const char *fi
 	cu->language = LANG_C;
 	cu->uses_global_strings = false;
 	cu->dfops = &btf__ops;
+
+	/* Need ELF information for BTF encoding also */
+	if (conf->btf_encode) {
+		fd = open(filename, O_RDONLY), err = -1;
+		if (fd >= 0) {
+			if (elf_version(EV_CURRENT) == EV_NONE) {
+				fprintf(stderr, "%s: cannot set libelf version.\n", __func__);
+				goto out_free;
+			}
+			cu->elf = elf_begin(fd, ELF_C_READ_MMAP, NULL);
+			if (cu->elf == NULL) {
+				fprintf(stderr, "%s: cannot read %s ELF file.\n",
+					__func__, filename);
+				goto out_free;
+			}
+		}
+	}
 
 	libbpf_set_print(libbpf_log);
 
@@ -771,10 +788,16 @@ static int cus__load_btf(struct cus *cus, struct conf_load *conf, const char *fi
 		return 0;
 
 	cus__add(cus, cu);
-	return err;
 
 out_free:
-	cu__delete(cu); // will call btf__free(cu->priv);
+	if (cu->elf) {
+		elf_end(cu->elf);
+		cu->elf = NULL;
+	}
+	if (fd != -1)
+		close(fd);
+	if (err)
+		cu__delete(cu); // will call btf__free(cu->priv);
 	return err;
 }
 
