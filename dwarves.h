@@ -43,6 +43,7 @@ enum load_steal_kind {
 	LSK__KEEPIT,
 	LSK__DELETE,
 	LSK__STOP_LOADING,
+	LSK__ABORT,
 };
 
 /*
@@ -1021,6 +1022,7 @@ struct ftype {
 	uint8_t		 unexpected_reg:1;
 	uint8_t		 processed:1;
 	uint8_t		 inconsistent_proto:1;
+	uint8_t		 uncertain_parm_loc:1;
 	struct list_head template_type_params;
 	struct list_head template_value_params;
 	struct template_parameter_pack *template_parameter_pack;
