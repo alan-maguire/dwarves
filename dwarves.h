@@ -481,6 +481,19 @@ bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool ver
 			continue;			\
 		else
 
+/**
+ * cu__for_each_inline_expansion - iterate thru all inline expansions
+ * @cu: struct cu instance to iterate
+ * @pos: struct tag iterator
+ * @id: uint32_t tag id
+ */
+#define cu__for_each_inline_expansion(cu, id, pos)	\
+	for (id = 0; id < cu->tags_table.nr_entries; ++id) \
+		if (!tag__is_inline_expansion(cu->tags_table.entries[id]) || \
+		    !(pos = tag__inline_expansion(cu->tags_table.entries[id])))\
+			continue;			\
+		else
+
 int cu__add_tag(struct cu *cu, struct tag *tag, uint32_t *id);
 int cu__add_tag_with_id(struct cu *cu, struct tag *tag, uint32_t id);
 int cu__table_add_tag(struct cu *cu, struct tag *tag, uint32_t *id);
@@ -613,6 +626,11 @@ static inline bool tag__is_atomic(const struct tag *tag)
 static inline bool tag__is_restrict(const struct tag *tag)
 {
 	return tag->tag == DW_TAG_restrict_type;
+}
+
+static inline bool tag__is_inline_expansion(const struct tag *tag)
+{
+	return tag->tag == DW_TAG_inlined_subroutine;
 }
 
 static inline int tag__is_modifier(const struct tag *tag)
@@ -821,12 +839,21 @@ struct ip_tag {
 
 struct inline_expansion {
 	struct ip_tag	 ip;
-	const char	 *name;
+	const char	*name;
 	size_t		 size;
 	uint64_t	 high_pc;
 	struct list_head parms;
 	uint16_t   nr_parms;
+	struct function	*function;
 };
+
+/**
+ * inline_expansion__for_each_parameter - iterate thru all the parameters
+ * @ie: struct inline_expansion instance to iterate
+ * @pos: struct parameter iterator
+ */
+#define inline_expansion__for_each_parameter(ie, pos) \
+	list_for_each_entry(pos, &(ie)->parms, tag.node)
 
 static inline struct inline_expansion *
 				tag__inline_expansion(const struct tag *tag)
@@ -944,13 +971,30 @@ size_t lexblock__fprintf(const struct lexblock *lexblock, const struct cu *cu,
 			 struct function *function, uint16_t indent,
 			 const struct conf_fprintf *conf, FILE *fp);
 
+
+struct parameter_loc {
+	uint8_t is_const:1;
+	uint8_t is_deref:1;
+	uint8_t is_addr:1;
+	int8_t size;
+	union {
+		struct {
+			uint16_t reg;
+			uint16_t flags;
+			uint32_t offset;
+		};
+		uint64_t value;
+	};
+};
+
 struct parameter {
 	struct tag tag;
 	const char *name;
-	struct location location;
 	uint8_t optimized:1;
 	uint8_t unexpected_reg:1;
 	uint8_t has_loc:1;
+	struct parameter_loc locs[2];	/* multiple locs may be used */
+	uint8_t nlocs;
 };
 
 static inline struct parameter *tag__parameter(const struct tag *tag)
