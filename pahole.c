@@ -1183,16 +1183,24 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
  * floats, etc.  This ensures backwards compatibility.
  */
 #define BTF_DEFAULT_FEATURE(name, alias, initial_value)		\
-	{ #name, #alias, &conf_load.alias, initial_value, true, NULL }
+	{ #name, #alias, &conf_load.alias, initial_value, true, NULL, NULL }
 
 #define BTF_DEFAULT_FEATURE_CHECK(name, alias, initial_value, feature_check)	\
-	{ #name, #alias, &conf_load.alias, initial_value, true, feature_check }
+	{ #name, #alias, &conf_load.alias, initial_value, true, NULL, feature_check }
 
 #define BTF_NON_DEFAULT_FEATURE(name, alias, initial_value)	\
-	{ #name, #alias, &conf_load.alias, initial_value, false, NULL }
+	{ #name, #alias, &conf_load.alias, initial_value, false, NULL, NULL }
 
 #define BTF_NON_DEFAULT_FEATURE_CHECK(name, alias, initial_value, feature_check) \
-	{ #name, #alias, &conf_load.alias, initial_value, false, feature_check }
+	{ #name, #alias, &conf_load.alias, initial_value, false, NULL, feature_check }
+
+#define BTF_NON_DEFAULT_EXTRA_FEATURE_CHECK(name, alias, initial_value, feature_check)	\
+	{ #name, #alias, &conf_load.alias, initial_value, false, &conf_load.alias##_extra, feature_check }
+
+/* If a feature supports it, using ".extra" as a suffix for the feature name
+ * targets .BTF.extra section with the resultant BTF data.
+ */
+#define BTF_EXTRA_FEATURE_SUFFIX	".extra"
 
 static bool enum64_check(void)
 {
@@ -1209,6 +1217,11 @@ static bool attributes_check(void)
 	return btf__add_type_attr != NULL;
 }
 
+static bool locations_check(void)
+{
+	return btf__add_loc_proto != NULL;
+}
+
 struct btf_feature {
 	const char      *name;
 	const char      *option_alias;
@@ -1217,6 +1230,7 @@ struct btf_feature {
 	bool		default_enabled;	/* some nonstandard features may not
 						 * be enabled for --btf_features=default
 						 */
+	bool		*extra;			/* can store in .BTF.extra? */
 	bool		(*feature_check)(void);
 } btf_features[] = {
 	BTF_DEFAULT_FEATURE(encode_force, btf_encode_force, false),
@@ -1234,6 +1248,8 @@ struct btf_feature {
 	BTF_NON_DEFAULT_FEATURE(global_var, encode_btf_global_vars, false),
 	BTF_NON_DEFAULT_FEATURE_CHECK(attributes, btf_attributes, false,
 				      attributes_check),
+	BTF_NON_DEFAULT_EXTRA_FEATURE_CHECK(inline, btf_gen_inlines, false,
+					    locations_check),
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -1261,8 +1277,15 @@ static struct btf_feature *find_btf_feature(char *name)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
-		if (strcmp(name, btf_features[i].name) == 0)
+		if (strncmp(name, btf_features[i].name, strlen(btf_features[i].name)) == 0) {
+			/* Feature can optionally target .BTF.extra if it
+			 * is supported and has the .extra suffix.
+			 */
+			if (btf_features[i].extra)
+				*(btf_features[i].extra) = strstr(name, BTF_EXTRA_FEATURE_SUFFIX)
+							   != NULL;
 			return &btf_features[i];
+		}
 	}
 	return NULL;
 }
