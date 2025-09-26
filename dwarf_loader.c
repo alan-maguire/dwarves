@@ -1185,29 +1185,54 @@ static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
 	return ret;
 }
 
-/* For DW_AT_location 'attr':
- * - if first location is DW_OP_regXX with expected number, return the register;
- *   otherwise save the register for later return
- * - if location DW_OP_entry_value(DW_OP_regXX) with expected number is in the
- *   list, return the register; otherwise save register for later return
- * - otherwise if no register was found for locations, return -1.
+/* Retrieve location information for parameter; focus on simple locations
+ * like constants and register values.  Support multiple registers as
+ * it is possible for a value (struct) to be passed via multiple registers.
+ * Handle edge cases like multiple instances of same location value, but
+ * avoid cases with large (>1 size) expressions to keep things simple.
+ * This covers the vast majority of cases.  The only unhandled atom is
+ * DW_OP_GNU_parameter_ref; future work could add that and improve
+ * location handling.  In practice the below supports the majority
+ * of parameter locations.
  */
-static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
+static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct parameter *parm)
 {
-	Dwarf_Addr base, start, end;
-	Dwarf_Op *expr, *entry_ops;
-	Dwarf_Attribute entry_attr;
-	size_t exprlen, entry_len;
+	Dwarf_Addr base, start, end, first = -1;
+	Dwarf_Attribute next_attr;
 	ptrdiff_t offset = 0;
-	int loc_num = -1;
+	Dwarf_Op *expr;
+	size_t exprlen;
 	int ret = -1;
+
+	/* parameter__locs() can be called recursively, but at toplevel
+	 * die is non-NULL signalling we need to look up loc/const attrs.
+	 */
+	if (die) {
+		if (dwarf_attr(die, DW_AT_const_value, attr) != NULL) {
+			parm->has_loc = 1;
+			parm->optimized = 1;
+			parm->locs[0].is_const = 1;
+			parm->nlocs = 1;
+			parm->locs[0].size = 8;
+			parm->locs[0].value = attr_numeric(die, DW_AT_const_value);
+			return 0;
+		}
+		if (dwarf_attr(die, DW_AT_location, attr) == NULL)
+			return 0;
+	}
 
 	/* use libdw__lock as dwarf_getlocation(s) has concurrency issues
 	 * when libdw is not compiled with experimental --enable-thread-safety
 	 */
 	pthread_mutex_lock(&libdw__lock);
 	while ((offset = __dwarf_getlocations(attr, offset, &base, &start, &end, &expr, &exprlen)) > 0) {
-		loc_num++;
+		/* We only want location info referring to start of function;
+		 * assumes we get location info in address order; empirically
+		 * this is the case.  Only exception is DW_OP_*entry_value
+		 * location info which always refers to the value on entry.
+		 */
+		if (first == -1)
+			first = start;
 
 		/* Convert expression list (XX DW_OP_stack_value) -> (XX).
 		 * DW_OP_stack_value instructs interpreter to pop current value from
@@ -1216,33 +1241,154 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
 		if (exprlen > 1 && expr[exprlen - 1].atom == DW_OP_stack_value)
 			exprlen--;
 
-		if (exprlen != 1)
-			continue;
+		if (exprlen > 1) {
+			/* ignore complex exprs not at start of function,
+			 * but bail if we hit a complex loc expr at the start.
+			 */
+			if (start != first)
+				continue;
+			ret = -1;
+			goto out;
+		}
 
 		switch (expr->atom) {
-		/* match DW_OP_regXX at first location */
-		case DW_OP_reg0 ... DW_OP_reg31:
-			if (loc_num != 0)
-				break;
-			ret = expr->atom;
-			if (ret == expected_reg)
-				goto out;
+		case DW_OP_deref:
+			if (parm->nlocs > 0)
+				parm->locs[parm->nlocs - 1].is_deref = 1;
+			else
+				ret = -1;
 			break;
-		/* match DW_OP_entry_value(DW_OP_regXX) at any location */
+		case DW_OP_reg0 ... DW_OP_reg31:
+			if (start != first || parm->nlocs > 1)
+				break;
+			/* avoid duplicate location value */
+			if (parm->nlocs > 0 && parm->locs[parm->nlocs - 1].reg ==
+					       (expr->atom - DW_OP_reg0))
+				break;
+			parm->locs[parm->nlocs].reg = expr->atom - DW_OP_reg0;
+			parm->locs[parm->nlocs].is_deref = 0;
+			parm->locs[parm->nlocs].size = 8;
+			parm->locs[parm->nlocs++].offset = 0;
+			ret = 0;
+			break;
+		case DW_OP_fbreg:
+		case DW_OP_breg0 ... DW_OP_breg31:
+			if (start != first || parm->nlocs > 1)
+				break;
+			/* avoid duplicate location value */
+			if (parm->nlocs > 0 && parm->locs[parm->nlocs - 1].reg ==
+					       (expr->atom - DW_OP_breg0)) {
+				if (parm->locs[parm->nlocs - 1].offset != expr->offset)
+					ret = -1;
+				break;
+			}
+			parm->locs[parm->nlocs].reg = expr->atom - DW_OP_breg0;
+			parm->locs[parm->nlocs].is_deref = 1;
+			parm->locs[parm->nlocs].size = 8;
+			parm->locs[parm->nlocs++].offset = expr->offset;
+			ret = 0;
+			break;
+		case DW_OP_lit0 ... DW_OP_lit31:
+			if (start != first)
+				break;
+
+			if (parm->nlocs > 0 && (expr->atom - DW_OP_lit0) ==
+					       parm->locs[parm->nlocs - 1].value)
+				break;
+			parm->locs[parm->nlocs].is_const = 1;
+			parm->locs[parm->nlocs].size = 1;
+			parm->locs[parm->nlocs++].value = expr->atom - DW_OP_lit0;
+			ret = 0;
+			break;
+		case DW_OP_const1u ... DW_OP_consts:
+			if (start != first)
+				break;
+			if (parm->nlocs > 0 && (parm->locs[parm->nlocs - 1].is_const &&
+			    expr->number == parm->locs[parm->nlocs - 1].value))
+				break;
+			parm->locs[parm->nlocs].is_const = 1;
+			parm->locs[parm->nlocs].value = expr->number;
+			switch (expr->atom) {
+			case DW_OP_const1u:
+				parm->locs[parm->nlocs].size = 1;
+				break;
+			case DW_OP_const1s:
+				parm->locs[parm->nlocs].size = -1;
+				break;
+			case DW_OP_const2u:
+				parm->locs[parm->nlocs].size = 2;
+				break;
+			case DW_OP_const2s:
+				parm->locs[parm->nlocs].size = -2;
+				break;
+			case DW_OP_const4u:
+				parm->locs[parm->nlocs].size = 4;
+				break;
+			case DW_OP_const4s:
+				parm->locs[parm->nlocs].size = -4;
+				break;
+			case DW_OP_const8u:
+			case DW_OP_constu:
+				parm->locs[parm->nlocs].size = 8;
+				break;
+			case DW_OP_const8s:
+			case DW_OP_consts:
+				parm->locs[parm->nlocs].size = -8;
+				break;
+			}
+			parm->nlocs++;
+			ret = 0;
+			break;
+		case DW_OP_addr:
+			if (start != first || parm->nlocs > 0)
+				break;
+			parm->locs[parm->nlocs].is_const = 1;
+			parm->locs[parm->nlocs].is_addr = 1;
+			parm->locs[parm->nlocs].size = 8;
+			parm->locs[parm->nlocs++].value = expr->number;
+			ret = 0;
+			break;
 		case DW_OP_entry_value:
 		case DW_OP_GNU_entry_value:
-			if (dwarf_getlocation_attr(attr, expr, &entry_attr) == 0 &&
-			    dwarf_getlocation(&entry_attr, &entry_ops, &entry_len) == 0 &&
-			    entry_len == 1) {
-				ret = entry_ops->atom;
-				if (ret == expected_reg)
-					goto out;
+			/* Match DW_OP_entry_value(DW_OP_regXX) at any offset
+			 * in function since it always describes value on entry.
+			 */
+			if (dwarf_getlocation_attr(attr, expr, &next_attr) == 0) {
+				pthread_mutex_unlock(&libdw__lock);
+				return parameter__locs(NULL, &next_attr, parm);
 			}
+			ret = -1;
+			break;
+		case DW_OP_implicit_pointer:
+			if (start != first)
+				break;
+			if (dwarf_getlocation_implicit_pointer(attr, expr, &next_attr) == 0) {
+				pthread_mutex_unlock(&libdw__lock);
+				return parameter__locs(NULL, &next_attr, parm);
+			}
+			ret = -1;
+			break;
+		case DW_OP_implicit_value:
+			if (start != first)
+				break;
+			if (dwarf_getlocation_attr(attr, expr, &next_attr) == 0) {
+				pthread_mutex_unlock(&libdw__lock);
+				return parameter__locs(NULL, &next_attr, parm);
+			}
+			ret = -1;
+			break;
+		default:
+			/* unhandled op */
+			ret = -1;
 			break;
 		}
+		if (ret == -1)
+			break;
 	}
 out:
 	pthread_mutex_unlock(&libdw__lock);
+	if (ret == 0)
+		parm->has_loc = 1;
 	return ret;
 }
 
@@ -1250,10 +1396,11 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 					struct conf_load *conf, int param_idx)
 {
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
+	int ret;
 
 	if (parm != NULL) {
-		bool has_const_value;
 		Dwarf_Attribute attr;
+		int expected_reg;
 
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
@@ -1293,28 +1440,31 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		 * between these parameter representations.  See
 		 * ftype__recode_dwarf_types() below for how this is handled.
 		 */
-		has_const_value = dwarf_attr(die, DW_AT_const_value, &attr) != NULL;
-		parm->has_loc = dwarf_attr(die, DW_AT_location, &attr) != NULL;
+		expected_reg = cu->register_params[param_idx];
+		if (expected_reg >= DW_OP_reg0)
+			expected_reg -= DW_OP_reg0;
 
-		if (parm->has_loc) {
-			struct location location;
-			attr_location(die, &location.expr, &location.exprlen);
+		ret = parameter__locs(die, &attr, parm);
 
-			int expected_reg = cu->register_params[param_idx];
-			int actual_reg = parameter__reg(&attr, expected_reg);
+		if (!parm->has_loc)
+			return parm;
 
-			if (actual_reg < 0)
-				parm->optimized = 1;
-			else if (expected_reg >= 0 && expected_reg != actual_reg)
-				/* mark parameters that use an unexpected
-				 * register to hold a parameter; these will
-				 * be problematic for users of BTF as they
-				 * violate expectations about register
-				 * contents.
-				 */
-				parm->unexpected_reg = 1;
-		} else if (has_const_value) {
+		if (ret < 0) {
+			/* undecipherable location */
 			parm->optimized = 1;
+			return parm;
+		}
+		if (parm->locs[0].is_const) {
+			parm->optimized = 1;
+		} else if (expected_reg >= 0 &&
+			   expected_reg != parm->locs[0].reg) {
+			/* mark parameters that use an unexpected
+			 * register to hold a parameter; these will
+			 * be problematic for users of BTF as they
+			 * violate expectations about register
+			 * contents.
+			 */
+			parm->unexpected_reg = 1;
 		}
 	}
 
@@ -1377,10 +1527,14 @@ static struct inline_expansion *inline_expansion__new(Dwarf_Die *die, struct cu 
 		dwarf_tag__set_attr_type(dtag, type, die, DW_AT_abstract_origin);
 
 		Dwarf_Attribute attr_orig;
+		exp->name = 0;
 		if (dwarf_attr(die, DW_AT_abstract_origin, &attr_orig)) {
 			Dwarf_Die die_orig;
-			if (dwarf_formref_die(&attr_orig, &die_orig)) {
-				exp->name = attr_string(&die_orig, DW_AT_name, conf);
+
+			if (dwarf_formref_die(&attr_orig, &die_orig) &&
+			    dwarf_tag(&die_orig) == DW_TAG_subprogram) {
+				if (dwarf_hasattr(&die_orig, DW_AT_name))
+					exp->name = attr_string(&die_orig, DW_AT_name, conf);
 			}
 		}
 
@@ -2686,12 +2840,12 @@ static void inline_expansion__recode_dwarf_types(struct tag *tag, struct cu *cu)
 	 * in fact an abtract origin, i.e. must be looked up in the tags_table,
 	 * not in the types_table.
 	 */
-	struct dwarf_tag *ftype = NULL;
+	struct dwarf_tag *function = NULL;
 	if (dtag->type != 0)
-		ftype = dwarf_cu__find_tag_by_ref(dcu, dtag, type);
+		function = dwarf_cu__find_tag_by_ref(dcu, dtag, type);
 	else
-		ftype = dwarf_cu__find_tag_by_ref(dcu, dtag, abstract_origin);
-	if (ftype == NULL) {
+		function = dwarf_cu__find_tag_by_ref(dcu, dtag, abstract_origin);
+	if (function == NULL) {
 		if (dtag->type != 0)
 			tag__print_type_not_found(tag);
 		else
@@ -2699,13 +2853,14 @@ static void inline_expansion__recode_dwarf_types(struct tag *tag, struct cu *cu)
 		return;
 	}
 
-	ftype__recode_dwarf_types(dtag__tag(ftype), cu);
+	ftype__recode_dwarf_types(dtag__tag(function), cu);
 
 	struct tag *pos;
 	struct inline_expansion *exp = tag__inline_expansion(tag);
 	list_for_each_entry(pos, &exp->parms, node)
 		parameter__recode_dwarf_type(tag__parameter(pos), cu);
-	exp->ip.tag.type = ftype->small_id;
+	exp->ip.tag.type = function->small_id;
+	exp->function = tag__function(dtag__tag(function));
 }
 
 static void lexblock__recode_dwarf_types(struct lexblock *tag, struct cu *cu)
@@ -2982,6 +3137,14 @@ static int cu__resolve_func_ret_types_optimized(struct cu *cu)
 		struct parameter *pos;
 		struct function *fn = tag__function(tag);
 		bool has_unexpected_reg = false, has_struct_param = false;
+
+		/* Inlined function representations likely have parameters
+		 * in wrong locations; ensure they do not contribute to
+		 * classification of unexpected regs for a function that
+		 * is partially inlined.
+		 */
+		if (fn->inlined)
+			continue;
 
 		/* mark function as optimized if parameter is, or
 		 * if parameter does not have a location; at this
