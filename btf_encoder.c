@@ -35,6 +35,7 @@
 #include <pthread.h>
 
 #define BTF_BASE_ELF_SEC	".BTF.base"
+#define BTF_EXTRA_ELF_SEC	".BTF.extra"
 #define BTF_IDS_SECTION		".BTF_ids"
 #define BTF_ID_FUNC_PFX		"__BTF_ID__func__"
 #define BTF_ID_SET8_PFX		"__BTF_ID__set8__"
@@ -42,6 +43,38 @@
 #define BTF_KFUNC_TYPE_TAG	"bpf_kfunc"
 #define BTF_FASTCALL_TAG       "bpf_fastcall"
 #define BPF_ARENA_ATTR         "address_space(1)"
+
+/* For older libbpf may need to define BTF loc data. */
+#if !defined(BTF_KIND_LOC_UAPI_DEFINED) && !defined(BTF_KIND_LOC_LIBBPF_DEFINED)
+#define BTF_KIND_LOC_PARAM      20
+#define BTF_KIND_LOC_PROTO      21
+#define BTF_KIND_LOCSEC         22
+
+#define BTF_TYPE_LOC_PARAM_SIZE(t)      ((__s32)((t)->size))
+#define BTF_LOC_FLAG_DEREF		0x1
+#define BTF_LOC_FLAG_CONTINUE		0x2
+
+struct btf_loc_param {
+	union {
+		struct {
+			__u16 reg;      /* register number */
+			__u16 flags;    /* register dereference */
+			__s32 offset;   /* offset from register-stored address */
+		};
+		struct {
+			__u32 val_lo32; /* lo 32 bits of 64-bit value */
+			__u32 val_hi32; /* hi 32 bits of 64-bit value */
+		};
+	};
+};
+
+struct btf_loc {
+        __u32 name_off;
+        __u32 func_proto;
+        __u32 loc_proto;
+        __u32 offset;
+};
+#endif
 
 /* kfunc flags, see include/linux/btf.h in the kernel source */
 #define KF_FASTCALL   (1 << 12)
@@ -77,10 +110,25 @@ struct btf_encoder_func_annot {
 	int16_t component_idx;
 };
 
+struct loc_param {
+	struct parameter_loc *locs;
+	uint8_t nlocs;
+};
+
+struct loc {
+	char *name;
+	struct loc_param *params;
+	uint8_t nparams;
+	int func_proto_id;
+	int loc_proto_id;
+	uint32_t offset;
+};
+
 /* state used to do later encoding of saved functions */
 struct btf_encoder_func_state {
 	struct btf_encoder *encoder;
 	struct elf_function *elf;
+	struct loc *loc;
 	uint32_t type_id_off;
 	uint16_t nr_parms;
 	uint16_t nr_annots;
@@ -125,6 +173,12 @@ struct elf_functions {
 	int cnt;
 };
 
+struct btf_encoder_func_states {
+	struct btf_encoder_func_state *array;
+	int cnt;
+	int cap;
+};
+
 /*
  * cu: cu being processed.
  */
@@ -150,11 +204,9 @@ struct btf_encoder {
 	struct elf_secinfo *secinfo;
 	size_t             seccnt;
 	int                encode_vars;
-	struct {
-		struct btf_encoder_func_state *array;
-		int cnt;
-		int cap;
-	} func_states;
+	struct btf_encoder_func_states func_states;
+	struct btf_encoder_func_states loc_states;
+	__u32		   *dedup_map;
 	/* This is a list of elf_functions tables, one per ELF.
 	 * Multiple ELF modules can be processed in one pahole run,
 	 * so we have to store elf_functions tables per ELF.
@@ -812,14 +864,16 @@ static int btf__add_bpf_arena_type_tags(struct btf *btf, struct btf_encoder_func
 
 static inline bool is_kfunc_state(struct btf_encoder_func_state *state)
 {
-	return state && state->elf && state->elf->kfunc;
+	if (!state || !state->elf)
+		return false;
+	return state->elf->kfunc;
 }
 
 static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct ftype *ftype,
 					   struct btf_encoder_func_state *state)
 {
+	struct btf *btf = encoder->btf;
 	const struct btf_type *t;
-	struct btf *btf;
 	struct parameter *param;
 	uint16_t nr_params, param_idx;
 	int32_t id, type_id;
@@ -829,19 +883,24 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 	assert(ftype != NULL || state != NULL);
 
 	if (is_kfunc_state(state) && encoder->tag_kfuncs && encoder->encode_attributes)
-		if (btf__add_bpf_arena_type_tags(encoder->btf, state) < 0)
+		if (btf__add_bpf_arena_type_tags(btf, state) < 0)
 			return -1;
 
 	/* add btf_type for func_proto */
 	if (ftype) {
-		btf = encoder->btf;
 		nr_params = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
 		type_id = btf_encoder__tag_type(encoder, ftype->tag.type);
 	} else if (state) {
-		encoder = state->encoder;
-		btf = state->encoder->btf;
 		nr_params = state->nr_parms;
 		type_id = state->ret_type_id;
+		/* ret type_id may need to be adjusted after dedup; if
+		 * dedup_map is present, adjust id to the post-dedup
+		 * id.  This is used when creating .BTF.extra which
+		 * refers to .BTF that has ben deduped; since we
+		 * recorded the type id it has changed due to dedup.
+		 */
+		if (encoder->dedup_map)
+			type_id = encoder->dedup_map[type_id];
 	} else {
 		return 0;
 	}
@@ -886,7 +945,13 @@ static int32_t btf_encoder__add_func_proto(struct btf_encoder *encoder, struct f
 			 */
 			strncpy(tmp_name, name, sizeof(tmp_name) - 1);
 
-			if (btf_encoder__add_func_param(encoder, tmp_name, p->type_id,
+			/* Similar to above, parameter type_id may need to be
+			 * adjusted after dedup.
+			 */
+			type_id = p->type_id;
+			if (encoder->dedup_map)
+				type_id = encoder->dedup_map[p->type_id];
+			if (btf_encoder__add_func_param(encoder, tmp_name, type_id,
 							param_idx == nr_params))
 				return -1;
 		}
@@ -1165,26 +1230,27 @@ static bool funcs__match(struct btf_encoder_func_state *s1,
 	return true;
 }
 
-static struct btf_encoder_func_state *btf_encoder__alloc_func_state(struct btf_encoder *encoder)
+static struct btf_encoder_func_state *
+btf_encoder__alloc_func_state(struct btf_encoder_func_states *func_states)
 {
 	struct btf_encoder_func_state *state, *tmp;
 
-	if (encoder->func_states.cnt >= encoder->func_states.cap) {
+	if (func_states->cnt >= func_states->cap) {
 
 		/* We only need to grow to accommodate duplicate
 		 * function declarations across different CUs, so the
 		 * rate of the array growth shouldn't be high.
 		 */
-		encoder->func_states.cap += 64;
+		func_states->cap += 64;
 
-		tmp = realloc(encoder->func_states.array, sizeof(*tmp) * encoder->func_states.cap);
+		tmp = realloc(func_states->array, sizeof(*tmp) * func_states->cap);
 		if (!tmp)
 			return NULL;
 
-		encoder->func_states.array = tmp;
+		func_states->array = tmp;
 	}
 
-	state = &encoder->func_states.array[encoder->func_states.cnt++];
+	state = &func_states->array[func_states->cnt++];
 	memset(state, 0, sizeof(*state));
 
 	return state;
@@ -1217,6 +1283,9 @@ static bool elf_function__has_ambiguous_address(struct elf_function *func)
 	uint64_t addr = 0;
 	int i;
 
+	if (!func)
+		return false;
+
 	if (func->sym_cnt <= 1)
 		return false;
 
@@ -1232,30 +1301,33 @@ static bool elf_function__has_ambiguous_address(struct elf_function *func)
 	return false;
 }
 
-static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn, struct elf_function *func)
+static int btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn,
+				  struct elf_function *func, struct loc *loc)
 {
-	struct btf_encoder_func_state *state = btf_encoder__alloc_func_state(encoder);
+	struct btf_encoder_func_state *state = btf_encoder__alloc_func_state(loc ?
+					       &encoder->loc_states :
+					       &encoder->func_states);
 	struct ftype *ftype = &fn->proto;
 	struct btf *btf = encoder->btf;
 	struct llvm_annotation *annot;
 	struct parameter *param;
 	uint8_t param_idx = 0;
-	int str_off, err = 0;
+	int err = -ENOMEM;
+	int str_off;
 
 	if (!state)
 		return -ENOMEM;
 
 	state->encoder = encoder;
 	state->elf = func;
+	state->loc = loc;
 	state->ambiguous_addr = elf_function__has_ambiguous_address(func);
 	state->nr_parms = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
 	state->ret_type_id = ftype->tag.type == 0 ? 0 : encoder->type_id_off + ftype->tag.type;
 	if (state->nr_parms > 0) {
 		state->parms = zalloc(state->nr_parms * sizeof(*state->parms));
-		if (!state->parms) {
-			err = -ENOMEM;
+		if (!state->parms)
 			goto out;
-		}
 	}
 	state->inconsistent_proto = ftype->inconsistent_proto;
 	state->unexpected_reg = ftype->unexpected_reg;
@@ -1283,10 +1355,8 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 		uint8_t idx = 0;
 
 		state->annots = zalloc(state->nr_annots * sizeof(*state->annots));
-		if (!state->annots) {
-			err = -ENOMEM;
+		if (!state->annots)
 			goto out;
-		}
 		list_for_each_entry(annot, &fn->annots, node) {
 			str_off = btf__add_str(encoder->btf, annot->value);
 			if (str_off < 0) {
@@ -1350,6 +1420,10 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 	char tmp_value[KSYM_NAME_LEN];
 	uint16_t idx;
 	int err;
+
+	/* If inline, skip. */
+	if (!state->elf)
+		return 0;
 
 	btf_fnproto_id = btf_encoder__add_func_proto(encoder, NULL, state);
 	name = func->name;
@@ -1486,15 +1560,19 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder, bool skip_e
 		 */
 		add_to_btf |= !state->unexpected_reg && !state->inconsistent_proto && !state->uncertain_parm_loc && !state->ambiguous_addr;
 
-		if (state->uncertain_parm_loc)
+		if (!add_to_btf) {
 			btf_encoder__log_func_skip(encoder, saved_fns[i].elf,
-					"uncertain parameter location\n",
-					0, 0);
+				state->unexpected_reg ? "unexpected regs\n" :
+				state->inconsistent_proto ? "inconsistent prototype\n" :
+				state->uncertain_parm_loc ? "uncertain parameter locations\n" :
+				"ambiguous address location\n");
+		}
 
 		if (add_to_btf) {
 			err = btf_encoder__add_func(state->encoder, state);
 			if (err < 0)
 				goto out;
+
 		}
 	}
 
@@ -2108,8 +2186,146 @@ out:
 	return err;
 }
 
+static int saved_loc_funcs_cmp(const void *a, const void *b)
+{
+	const struct btf_encoder_func_state *al = a;
+	const struct btf_encoder_func_state *bl = b;
+
+	return al->loc->offset - bl->loc->offset;
+}
+
+static int btf_encoder__add_saved_loc_param(struct btf_encoder *encoder,
+					    struct loc_param *param,
+					    int32_t *param_ids,
+					    uint8_t *num_param_ids)
+
+{
+	uint16_t flags = param->nlocs > 1 ? BTF_LOC_FLAG_CONTINUE : 0;
+	uint64_t value;
+	bool is_const;
+	int32_t ret = 0;
+
+	/* do we have meaningful location data ? */
+	if (param->nlocs == 0)
+		goto out;
+
+	is_const = param->locs[0].is_const;
+	value = is_const ? param->locs[0].value : 0;
+	if (is_const) {
+		flags |= param->locs[0].flags;
+		if (param->locs[0].is_deref)
+			flags |= BTF_LOC_FLAG_DEREF;
+	}
+
+	ret = btf__add_loc_param(encoder->btf, param->locs[0].size, is_const, value,
+				 is_const ? 0 : param->locs[0].reg, flags,
+				 is_const ? 0 : param->locs[0].offset);
+	if (ret <= 0)
+		goto out;
+
+	if (ret > 0) {
+		param_ids[*num_param_ids] = ret;
+		if (param->nlocs == 2) {
+			(*num_param_ids)++;
+			is_const = param->locs[1].is_const;
+			value = is_const ? param->locs[1].value : 0;
+			flags = is_const ? 0 : param->locs[1].flags;
+			ret = btf__add_loc_param(encoder->btf,
+						 param->locs[1].size,
+						 is_const, value,
+						 is_const ? 0 : param->locs[1].reg,
+						 flags,
+						 is_const ? 0 : param->locs[1].offset);
+			if (ret > 0)
+				param_ids[*num_param_ids] = ret;
+		}
+	}
+out:
+	if (ret <= 0)
+		param_ids[*num_param_ids] = 0;
+
+	(*num_param_ids)++;
+	return ret;
+}
+
+static int32_t btf_encoder__add_locsecs(struct btf_encoder *encoder)
+{
+	struct btf_encoder_func_state *saved_loc_funcs = encoder->loc_states.array;
+	uint32_t i, nr_saved_loc_funcs = encoder->loc_states.cnt;
+	struct btf *btf = encoder->btf;
+	int32_t ret;
+
+	qsort(saved_loc_funcs, nr_saved_loc_funcs, sizeof(*saved_loc_funcs), saved_loc_funcs_cmp);
+
+	for (i = 0; i < nr_saved_loc_funcs; i++) {
+		struct btf_encoder_func_state *state = &saved_loc_funcs[i];
+		struct loc *loc = state->loc;
+		int32_t param_ids[32] = {};
+		uint8_t j = 0, num_param_ids = 0;
+
+		loc->func_proto_id = btf_encoder__add_func_proto(encoder, NULL, state);
+		if (loc->func_proto_id < 0) {
+			btf__log_err(btf, BTF_KIND_FUNC_PROTO, "func_proto", true,
+				     loc->func_proto_id,
+				     "Error emitting BTF func proto");
+		}
+		for (j = 0; j < loc->nparams; j++) {
+			ret = btf_encoder__add_saved_loc_param(encoder, &loc->params[j],
+							       param_ids, &num_param_ids);
+			if (ret < 0)
+				return ret;
+		}
+		loc->loc_proto_id = btf__add_loc_proto(btf);
+		if (loc->loc_proto_id < 0) {
+			btf__log_err(btf, BTF_KIND_LOC_PROTO, "loc_proto", true, loc->loc_proto_id,
+				     "Error emitting BTF location prototype");
+			return loc->loc_proto_id;
+		}
+		for (j = 0; j < num_param_ids; j++) {
+			ret = btf__add_loc_proto_param(btf, param_ids[j]);
+			if (ret < 0) {
+				btf__log_err(btf, BTF_KIND_LOC_PROTO, "loc_proto_param", true, ret,
+					     "Error emitting BTF location prototype param for %u",
+					     loc->loc_proto_id);
+				return ret;
+			}
+		}
+	}
+	for (i = 0; i < nr_saved_loc_funcs; i++) {
+		struct loc *loc = saved_loc_funcs[i].loc;
+
+		/* vlen max is 65535, so add a new locsec for each
+		 * 65535 locations.
+		 */
+		if (i == 0 || (i % 0xffff) == 0) {
+			int32_t id = btf__add_locsec(btf, "inline");
+
+			if (id < 0) {
+				btf__log_err(btf, BTF_KIND_LOCSEC, "inline",
+					     true, id, "Error emitting BTF type");
+				return id;
+			}
+		}
+		ret = btf__add_locsec_loc(btf, loc->name, loc->func_proto_id, loc->loc_proto_id,
+					 loc->offset);
+		if (ret < 0) {
+			btf__log_err(btf, BTF_KIND_LOCSEC, "inline", true, ret,
+				     "Error emitting BTF loc");
+			return ret;
+		}
+	}
+	return 0;
+}
+
 int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 {
+#if defined(BTF_KIND_LOC_UAPI_DEFINED) || defined(BTF_KIND_LOC_LIBBPF_DEFINED)
+	size_t map_sz = 0;
+	LIBBPF_OPTS(btf_dedup_opts, dedup_opts, .dedup_map = &encoder->dedup_map,
+		    .dedup_map_sz = &map_sz);
+#else
+	LIBBPF_OPTS(btf_dedup_opts, dedup_opts);
+#endif
 	int err;
 	size_t shndx;
 
@@ -2121,11 +2337,14 @@ int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 		if (gobuffer__size(&encoder->secinfo[shndx].secinfo))
 			btf_encoder__add_datasec(encoder, shndx);
 
+	if (encoder->loc_states.cnt && !conf->btf_gen_inlines_extra)
+		btf_encoder__add_locsecs(encoder);
+
 	/* Empty file, nothing to do, so... done! */
 	if (btf__type_cnt(encoder->btf) == 1)
 		return 0;
 
-	if (btf__dedup(encoder->btf, NULL)) {
+	if (btf__dedup(encoder->btf, &dedup_opts)) {
 		fprintf(stderr, "%s: btf__dedup failed!\n", __func__);
 		return -1;
 	}
@@ -2159,6 +2378,20 @@ int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 			return err;
 		}
 		err = btf_encoder__write_elf(encoder, encoder->btf, BTF_ELF_SEC);
+		if (!err && conf->btf_gen_inlines_extra) {
+			struct btf *base = encoder->btf;
+
+			encoder->btf = btf__new_empty_split(base);
+			encoder->type_id_off = btf__type_cnt(base) - 1;
+			err = btf_encoder__add_locsecs(encoder);
+			if (!err)
+				err = btf__dedup(encoder->btf, NULL);
+			if (!err)
+				err = btf_encoder__write_elf(encoder, encoder->btf,
+							     BTF_EXTRA_ELF_SEC);
+			btf__free(encoder->btf);
+			encoder->btf = base;
+		}
 	}
 
 	elf_functions_list__clear(&encoder->elf_functions_list);
@@ -2320,7 +2553,7 @@ static size_t get_elf_section(struct btf_encoder *encoder, uint64_t addr)
  * values. Prefixes should be added sparingly, and it should be objectively
  * obvious that they are not useful.
  */
-static bool filter_variable_name(const char *name)
+static bool filter_name(const char *name)
 {
 	static const struct { char *s; size_t len; } skip[] = {
 		#define X(str) {str, sizeof(str) - 1}
@@ -2429,7 +2662,7 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 		if (!name)
 			continue;
 
-		if (filter_variable_name(name))
+		if (filter_name(name))
 			continue;
 
 		/* A 0 address may be in a "discard" section; DWARF provides
@@ -2689,6 +2922,74 @@ static bool ftype__has_uncertain_arg_loc(struct cu *cu, struct ftype *ftype)
 	return false;
 }
 
+/* save loc params for later addition. */
+static int btf_encoder__add_loc_param(struct btf_encoder *encoder,
+				      struct inline_expansion *ie,
+				      struct parameter *param,
+				      uint64_t base,
+				      struct loc_param *lp)
+{
+	uint8_t i, nlocs;
+
+	nlocs = param->nlocs;
+	if (nlocs) {
+		lp->locs = calloc(nlocs, sizeof(struct parameter_loc));
+		if (!lp->locs)
+			return -ENOMEM;
+		memcpy(lp->locs, param->locs, nlocs * sizeof(struct parameter_loc));
+	}
+	lp->nlocs = nlocs;
+	for (i = 0; i < nlocs; i++) {
+		if (param->locs[i].is_addr && lp->locs[i].value >= base)
+			lp->locs[i].value -= base;
+	}
+	return nlocs;
+}
+
+static int btf_encoder__add_inline_expansion(struct btf_encoder *encoder,
+				      struct inline_expansion *ie, uint64_t base)
+{
+	struct loc *loc = calloc(1, sizeof(*loc));
+	struct parameter *param = NULL;
+	int err = -ENOMEM;
+
+	if (loc)
+		loc->name = strdup(ie->function->name);
+	if (!loc || !loc->name)
+		goto out;
+
+	inline_expansion__for_each_parameter(ie, param) {
+		loc->nparams++;
+	}
+
+	if (loc->nparams > 0) {
+		int i = 0;
+
+		loc->params = calloc(loc->nparams, sizeof(struct loc_param));
+		if (!loc->params)
+			goto out;
+		param = NULL;
+		inline_expansion__for_each_parameter(ie, param) {
+			err = btf_encoder__add_loc_param(encoder, ie, param, base,
+							 &loc->params[i++]);
+			if (err < 0)
+				goto out;
+		}
+	}
+	loc->offset = (uint32_t)(ie->ip.addr - base);
+
+	err = btf_encoder__save_func(encoder, ie->function, NULL, loc);
+	if (!err)
+		return 0;
+out:
+	if (loc) {
+		free(loc->name);
+		free(loc->params);
+	}
+	free(loc);
+	return err;
+}
+
 int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct conf_load *conf_load)
 {
 	struct llvm_annotation *annot;
@@ -2696,8 +2997,11 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	struct elf_functions *funcs;
 	uint32_t core_id;
 	struct function *fn;
+	struct inline_expansion *ie;
+	uint64_t base = 0;
 	struct tag *pos;
 	int err = 0;
+	size_t i;
 
 	encoder->cu = cu;
 	funcs = btf_encoder__elf_functions(encoder);
@@ -2815,9 +3119,33 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 		if (ftype__has_uncertain_arg_loc(cu, &fn->proto))
 			fn->proto.uncertain_parm_loc = 1;
 
-		err = btf_encoder__save_func(encoder, fn, func);
+		err = btf_encoder__save_func(encoder, fn, func, NULL);
 		if (err)
 			goto out;
+	}
+
+	core_id = 0;
+
+	/* Use .text base to adjust addresses from absolute to relative;
+	 * other sections like discarded-after init sections have different
+	 * ELF section base but a single global adjustment for kernel/module
+	 * is easier to manage.
+	 */
+	for (i = 1; i < encoder->seccnt; i++) {
+		if (!(encoder->secinfo[i].type == SHT_PROGBITS))
+			continue;
+		if (strcmp(encoder->secinfo[i].name, ".text") == 0) {
+			base = encoder->secinfo[i].addr;
+			break;
+		}
+	}
+
+	if (conf_load->btf_gen_inlines) {
+		cu__for_each_inline_expansion(cu, core_id, ie) {
+			if (!ie->ip.addr || !ie->name || filter_name(ie->name))
+				continue;
+			btf_encoder__add_inline_expansion(encoder, ie, base);
+		}
 	}
 
 	if (encoder->encode_vars)
