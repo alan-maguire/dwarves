@@ -2791,6 +2791,8 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 		 */
 		if (fn->declaration)
 			continue;
+		if (function__inlined(fn))
+			continue;
 		if (!ftype__has_arg_names(&fn->proto))
 			continue;
 		if (funcs->cnt) {
