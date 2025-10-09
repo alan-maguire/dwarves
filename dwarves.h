@@ -55,6 +55,13 @@ __weak extern int btf__add_enum64(struct btf *btf, const char *name, __u32 byte_
 __weak extern int btf__add_enum64_value(struct btf *btf, const char *name, __u64 value);
 __weak extern int btf__add_type_attr(struct btf *btf, const char *value, int ref_type_id);
 __weak extern int btf__distill_base(const struct btf *src_btf, struct btf **new_base_btf, struct btf **new_split_btf);
+__weak extern int btf__add_loc_param(struct btf *btf, __s32 size, bool is_value, __u64 value,
+				     __u16 reg, __u16 flags, __s32 offset);
+__weak extern int btf__add_loc_proto(struct btf *btf);
+__weak extern int btf__add_loc_proto_param(struct btf *btf, __u32 id);
+__weak extern int btf__add_locsec(struct btf *btf, const char *name);
+__weak extern int btf__add_locsec_loc(struct btf *btf, const char *name, __u32 func_proto,
+				      __u32 loc_proto, __u32 offset);
 
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
@@ -100,6 +107,8 @@ struct conf_load {
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
+	bool			btf_gen_inlines;
+	bool			btf_gen_inlines_extra;	/* target .BTF.extra? */
 	bool			btf_attributes;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;

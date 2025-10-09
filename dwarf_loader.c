@@ -1206,6 +1206,7 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 
 	/* parameter__locs() can be called recursively, but at toplevel
 	 * die is non-NULL signalling we need to look up loc/const attrs.
+	 * Only need to lock/unlock libdw__lock at toplevel.
 	 */
 	if (die) {
 		if (dwarf_attr(die, DW_AT_const_value, attr) != NULL) {
@@ -1219,12 +1220,12 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 		}
 		if (dwarf_attr(die, DW_AT_location, attr) == NULL)
 			return 0;
+		/* use libdw__lock as dwarf_getlocation(s) has concurrency issues
+		 * when libdw is not compiled with experimental --enable-thread-safety
+		 */
+		pthread_mutex_lock(&libdw__lock);
 	}
 
-	/* use libdw__lock as dwarf_getlocation(s) has concurrency issues
-	 * when libdw is not compiled with experimental --enable-thread-safety
-	 */
-	pthread_mutex_lock(&libdw__lock);
 	while ((offset = __dwarf_getlocations(attr, offset, &base, &start, &end, &expr, &exprlen)) > 0) {
 		/* We only want location info referring to start of function;
 		 * assumes we get location info in address order; empirically
@@ -1233,6 +1234,9 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 		 */
 		if (first == -1)
 			first = start;
+
+		if (exprlen == 0)
+			continue;
 
 		/* Convert expression list (XX DW_OP_stack_value) -> (XX).
 		 * DW_OP_stack_value instructs interpreter to pop current value from
@@ -1354,8 +1358,8 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 			 * in function since it always describes value on entry.
 			 */
 			if (dwarf_getlocation_attr(attr, expr, &next_attr) == 0) {
-				pthread_mutex_unlock(&libdw__lock);
-				return parameter__locs(NULL, &next_attr, parm);
+				ret = parameter__locs(NULL, &next_attr, parm);
+				goto out;
 			}
 			ret = -1;
 			break;
@@ -1363,8 +1367,8 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 			if (start != first)
 				break;
 			if (dwarf_getlocation_implicit_pointer(attr, expr, &next_attr) == 0) {
-				pthread_mutex_unlock(&libdw__lock);
-				return parameter__locs(NULL, &next_attr, parm);
+				ret = parameter__locs(NULL, &next_attr, parm);
+				goto out;
 			}
 			ret = -1;
 			break;
@@ -1372,8 +1376,8 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 			if (start != first)
 				break;
 			if (dwarf_getlocation_attr(attr, expr, &next_attr) == 0) {
-				pthread_mutex_unlock(&libdw__lock);
-				return parameter__locs(NULL, &next_attr, parm);
+				ret = parameter__locs(NULL, &next_attr, parm);
+				goto out;
 			}
 			ret = -1;
 			break;
@@ -1386,7 +1390,8 @@ static int parameter__locs(Dwarf_Die *die, Dwarf_Attribute *attr, struct paramet
 			break;
 	}
 out:
-	pthread_mutex_unlock(&libdw__lock);
+	if (die)
+		pthread_mutex_unlock(&libdw__lock);
 	if (ret == 0)
 		parm->has_loc = 1;
 	return ret;
