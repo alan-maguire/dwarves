@@ -2818,9 +2818,10 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 			dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
 			if (dtype == NULL)
 				dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
-			if (dtype != NULL)
+			if (dtype != NULL) {
 				fn->name = tag__function(dtag__tag(dtype))->name;
-			else {
+				fn->inlined = tag__function(dtag__tag(dtype))->inlined;
+			} else {
 				fprintf(stderr,
 					"%s: couldn't find name for "
 					"function %#llx, abstract_origin=%#llx,"
