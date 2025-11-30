@@ -187,11 +187,13 @@ static inline void elf_functions__delete(struct elf_functions *funcs)
 
 static int elf_functions__collect(struct elf_functions *functions);
 
-struct elf_functions *elf_functions__new(Elf *elf)
+struct elf_functions *elf_functions__new(struct btf_encoder *encoder)
 {
 	struct elf_functions *funcs;
+	Elf *elf;
 	int err;
 
+	elf = encoder->cu->elf;
 	funcs = calloc(1, sizeof(*funcs));
 	if (!funcs) {
 		err = -ENOMEM;
@@ -1552,7 +1554,7 @@ static struct elf_functions *btf_encoder__elf_functions(struct btf_encoder *enco
 
 	funcs = elf_functions__find(encoder->cu->elf, &encoder->elf_functions_list);
 	if (!funcs) {
-		funcs = elf_functions__new(encoder->cu->elf);
+		funcs = elf_functions__new(encoder);
 		if (funcs)
 			list_add(&funcs->node, &encoder->elf_functions_list);
 	}
