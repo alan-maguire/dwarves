@@ -1196,6 +1196,7 @@ struct func_info {
 };
 
 #define	PARM_DEFAULT_FAIL	-1
+#define	PARM_FBREG_FAIL		-2
 
 /* For DW_AT_location 'attr':
  * - if first location is DW_OP_regXX with expected number, return the register;
@@ -1239,6 +1240,15 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
 			ret = expr->atom;
 			if (ret == expected_reg)
 				goto out;
+			break;
+		case DW_OP_fbreg:
+			/* The locaiton like
+			 *   DW_AT_location        (DW_OP_fbreg +<num>)
+			 * indicates that the parameter is on the stack. But it is possible
+			 * that the parameter can fit in register(s). So conservatively
+			 * mark this parameter not suitable for true signatures.
+			 */
+			ret = PARM_FBREG_FAIL;
 			break;
 		/* match DW_OP_entry_value(DW_OP_regXX) at any location */
 		case DW_OP_entry_value:
@@ -1332,7 +1342,7 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 
 			if (actual_reg == PARM_DEFAULT_FAIL)
 				parm->optimized = 1;
-			else if (expected_reg >= 0 && expected_reg != actual_reg)
+			else if (actual_reg == PARM_FBREG_FAIL || (expected_reg >= 0 && expected_reg != actual_reg))
 				/* mark parameters that use an unexpected
 				 * register to hold a parameter; these will
 				 * be problematic for users of BTF as they
