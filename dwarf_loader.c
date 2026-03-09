@@ -1197,6 +1197,21 @@ struct func_info {
 
 #define	PARM_DEFAULT_FAIL	-1
 #define	PARM_FAIL_CLANG		-2
+#define	PARM_OPTIMIZED_CLANG	-3
+#define	PARM_CONTINUE		-4
+
+static int parameter__multi_exprs(Dwarf_Op *expr, int loc_num) {
+	switch (expr[0].atom) {
+	case DW_OP_lit0 ... DW_OP_lit31:
+	case DW_OP_constu:
+	case DW_OP_consts:
+		if (loc_num != 0)
+			break;
+		return PARM_OPTIMIZED_CLANG;
+	}
+
+	return PARM_CONTINUE;
+}
 
 /* For DW_AT_location 'attr':
  * - if first location is DW_OP_regXX with expected number, return the register;
@@ -1229,8 +1244,17 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct cu *cu
 		if (exprlen == 2 && expr[exprlen - 1].atom == DW_OP_stack_value)
 			exprlen--;
 
-		if (exprlen != 1)
-			continue;
+		if (exprlen != 1) {
+			if (!cu->producer_clang || !conf->true_signature)
+				continue;
+
+			int res;
+			res = parameter__multi_exprs(expr, loc_num);
+			if (res == PARM_CONTINUE)
+				continue;
+			ret = res;
+			goto out;
+		}
 
 		switch (expr->atom) {
 		/* match DW_OP_regXX at first location */
@@ -1250,6 +1274,16 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct cu *cu
 			 */
 			if (cu->producer_clang && conf->true_signature)
 				ret = PARM_FAIL_CLANG;
+			break;
+		case DW_OP_lit0 ... DW_OP_lit31:
+		case DW_OP_constu:
+		case DW_OP_consts:
+			if (cu->producer_clang && conf->true_signature) {
+				if (loc_num != 0)
+					break;
+				ret = PARM_OPTIMIZED_CLANG;
+				goto out;
+			}
 			break;
 		/* match DW_OP_entry_value(DW_OP_regXX) at any location */
 		case DW_OP_entry_value:
@@ -1341,9 +1375,12 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 			int expected_reg = cu->register_params[reg_idx];
 			int actual_reg = parameter__reg(&attr, expected_reg, cu, conf);
 
-			if (actual_reg == PARM_DEFAULT_FAIL)
+			if (actual_reg == PARM_DEFAULT_FAIL) {
 				parm->optimized = 1;
-			else if (actual_reg == PARM_FAIL_CLANG || (expected_reg >= 0 && expected_reg != actual_reg))
+			} else if (actual_reg == PARM_OPTIMIZED_CLANG) {
+				parm->optimized = 1;
+				info->skip_idx++;
+			} else if (actual_reg == PARM_FAIL_CLANG || (expected_reg >= 0 && expected_reg != actual_reg)) {
 				/* mark parameters that use an unexpected
 				 * register to hold a parameter; these will
 				 * be problematic for users of BTF as they
@@ -1351,6 +1388,7 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 				 * contents.
 				 */
 				parm->unexpected_reg = 1;
+			}
 		} else if (!cu->producer_clang && has_const_value) {
 			parm->optimized = 1;
 		} else if (cu->producer_clang) {
