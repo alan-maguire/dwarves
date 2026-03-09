@@ -1196,6 +1196,7 @@ struct func_info {
 };
 
 #define	PARM_DEFAULT_FAIL	-1
+#define	PARM_FAIL_CLANG		-2
 
 /* For DW_AT_location 'attr':
  * - if first location is DW_OP_regXX with expected number, return the register;
@@ -1204,7 +1205,7 @@ struct func_info {
  *   list, return the register; otherwise save register for later return
  * - otherwise if no register was found for locations, return PARM_DEFAULT_FAIL.
  */
-static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
+static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct cu *cu, struct conf_load *conf)
 {
 	Dwarf_Addr base, start, end;
 	Dwarf_Op *expr, *entry_ops;
@@ -1239,6 +1240,16 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
 			ret = expr->atom;
 			if (ret == expected_reg)
 				goto out;
+			break;
+		case DW_OP_fbreg:
+			/* The locaiton like
+			 *   DW_AT_location        (DW_OP_fbreg +<num>)
+			 * indicates that the parameter is on the stack. But it is possible
+			 * that the parameter can fit in register(s). So conservatively
+			 * mark this parameter not suitable for true signatures.
+			 */
+			if (cu->producer_clang && conf->true_signature)
+				ret = PARM_FAIL_CLANG;
 			break;
 		/* match DW_OP_entry_value(DW_OP_regXX) at any location */
 		case DW_OP_entry_value:
@@ -1328,11 +1339,11 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 
 		if (parm->has_loc) {
 			int expected_reg = cu->register_params[reg_idx];
-			int actual_reg = parameter__reg(&attr, expected_reg);
+			int actual_reg = parameter__reg(&attr, expected_reg, cu, conf);
 
 			if (actual_reg == PARM_DEFAULT_FAIL)
 				parm->optimized = 1;
-			else if (expected_reg >= 0 && expected_reg != actual_reg)
+			else if (actual_reg == PARM_FAIL_CLANG || (expected_reg >= 0 && expected_reg != actual_reg))
 				/* mark parameters that use an unexpected
 				 * register to hold a parameter; these will
 				 * be problematic for users of BTF as they
