@@ -1190,6 +1190,10 @@ static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
 	return ret;
 }
 
+struct func_info {
+	bool signature_changed;
+};
+
 /* For DW_AT_location 'attr':
  * - if first location is DW_OP_regXX with expected number, return the register;
  *   otherwise save the register for later return
@@ -1252,7 +1256,8 @@ out:
 }
 
 static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
-					struct conf_load *conf, int param_idx)
+					struct conf_load *conf, int param_idx,
+					struct func_info *info)
 {
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
@@ -1264,6 +1269,8 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		parm->name = attr_string(die, DW_AT_name, conf);
 		parm->idx = param_idx;
 		if (param_idx >= cu->nr_register_params || param_idx < 0)
+			return parm;
+		if (cu->producer_clang && !info->signature_changed)
 			return parm;
 		/* Parameters which use DW_AT_abstract_origin to point at
 		 * the original parameter definition (with no name in the DIE)
@@ -1337,7 +1344,7 @@ static int formal_parameter_pack__load_params(struct formal_parameter_pack *pack
 			continue;
 		}
 
-		struct parameter *param = parameter__new(die, cu, conf, -1);
+		struct parameter *param = parameter__new(die, cu, conf, -1, NULL);
 
 		if (param == NULL)
 			return -1;
@@ -1502,6 +1509,29 @@ static struct ftype *ftype__new(Dwarf_Die *die, struct cu *cu)
 	return ftype;
 }
 
+static bool function__signature_changed(struct function *func, Dwarf_Die *die)
+{
+	/* The inlined DW_TAG_subprogram typically has the original source type for
+	 * abstract origin of a concrete function with address range, inlined subroutine,
+	 * or call site.
+	 */
+	if (func->inlined)
+		return false;
+
+	if (!func->abstract_origin)
+		return attr_numeric(die, DW_AT_calling_convention) == DW_CC_nocall;
+
+	Dwarf_Attribute attr;
+	if (dwarf_attr(die, DW_AT_abstract_origin, &attr)) {
+		Dwarf_Die origin;
+		if (dwarf_formref_die(&attr, &origin))
+			return attr_numeric(&origin, DW_AT_calling_convention) == DW_CC_nocall;
+	}
+
+	/* This should not happen */
+	return false;
+}
+
 static struct function *function__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct function *func = tag__alloc(cu, sizeof(*func));
@@ -1527,6 +1557,7 @@ static struct function *function__new(Dwarf_Die *die, struct cu *cu, struct conf
 		func->cu_total_size_inline_expansions = 0;
 		func->cu_total_nr_inline_expansions = 0;
 		func->priv = NULL;
+		func->signature_changed = function__signature_changed(func, die);
 	}
 
 	return func;
@@ -1800,9 +1831,9 @@ static struct tag *die__create_new_parameter(Dwarf_Die *die,
 					     struct ftype *ftype,
 					     struct lexblock *lexblock,
 					     struct cu *cu, struct conf_load *conf,
-					     int param_idx)
+					     int param_idx, struct func_info *info)
 {
-	struct parameter *parm = parameter__new(die, cu, conf, param_idx);
+	struct parameter *parm = parameter__new(die, cu, conf, param_idx, info);
 
 	if (parm == NULL)
 		return NULL;
@@ -1889,7 +1920,7 @@ static struct tag *die__create_new_subroutine_type(Dwarf_Die *die,
 			tag__print_not_supported(die);
 			continue;
 		case DW_TAG_formal_parameter:
-			tag = die__create_new_parameter(die, ftype, NULL, cu, conf, -1);
+			tag = die__create_new_parameter(die, ftype, NULL, cu, conf, -1, NULL);
 			break;
 		case DW_TAG_unspecified_parameters:
 			ftype->unspec_parms = 1;
@@ -2118,7 +2149,8 @@ out_enomem:
 }
 
 static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
-				  struct lexblock *lexblock, struct cu *cu, struct conf_load *conf);
+				 struct lexblock *lexblock, struct cu *cu, struct conf_load *conf,
+				 struct func_info *info);
 
 static int die__create_new_lexblock(Dwarf_Die *die,
 				    struct cu *cu, struct lexblock *father, struct conf_load *conf)
@@ -2126,7 +2158,7 @@ static int die__create_new_lexblock(Dwarf_Die *die,
 	struct lexblock *lexblock = lexblock__new(die, cu);
 
 	if (lexblock != NULL) {
-		if (die__process_function(die, NULL, lexblock, cu, conf) != 0)
+		if (die__process_function(die, NULL, lexblock, cu, conf, NULL) != 0)
 			goto out_delete;
 	}
 	if (father != NULL)
@@ -2246,7 +2278,8 @@ static struct tag *die__create_new_inline_expansion(Dwarf_Die *die,
 }
 
 static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
-				 struct lexblock *lexblock, struct cu *cu, struct conf_load *conf)
+				 struct lexblock *lexblock, struct cu *cu, struct conf_load *conf,
+				 struct func_info *info)
 {
 	int param_idx = 0;
 	Dwarf_Die child;
@@ -2320,7 +2353,7 @@ static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
 			continue;
 		}
 		case DW_TAG_formal_parameter:
-			tag = die__create_new_parameter(die, ftype, lexblock, cu, conf, param_idx++);
+			tag = die__create_new_parameter(die, ftype, lexblock, cu, conf, param_idx++, info);
 			break;
 		case DW_TAG_variable:
 			tag = die__create_new_variable(die, cu, conf, 0);
@@ -2391,9 +2424,10 @@ out_enomem:
 static struct tag *die__create_new_function(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct function *function = function__new(die, cu, conf);
+	struct func_info info = { function->signature_changed };
 
 	if (function != NULL &&
-	    die__process_function(die, &function->proto, &function->lexblock, cu, conf) != 0) {
+	    die__process_function(die, &function->proto, &function->lexblock, cu, conf, &info) != 0) {
 		function__delete(function, cu);
 		function = NULL;
 	}
@@ -3045,6 +3079,21 @@ static unsigned long long dwarf_tag__orig_id(const struct tag *tag,
 	return cu->extra_dbg_info ? dtag->id : 0;
 }
 
+static bool attr_producer_clang(Dwarf_Die *die)
+{
+	Dwarf_Attribute attr;
+	const char *producer;
+
+	if (dwarf_attr(die, DW_AT_producer, &attr) == NULL)
+		return false;
+
+	producer = dwarf_formstring(&attr);
+	if (!producer)
+		return false;
+
+	return !!strstr(producer, "clang");
+}
+
 struct debug_fmt_ops dwarf__ops;
 
 static int die__process(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
@@ -3082,6 +3131,7 @@ static int die__process(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 	}
 
 	cu->language = attr_numeric(die, DW_AT_language);
+	cu->producer_clang = attr_producer_clang(die);
 
 	if (conf->early_cu_filter)
 		cu = conf->early_cu_filter(cu);
@@ -3841,6 +3891,7 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 			cu->priv = dcu;
 			cu->dfops = &dwarf__ops;
 			cu->language = attr_numeric(cu_die, DW_AT_language);
+			cu->producer_clang = attr_producer_clang(cu_die);
 			cus__add(cus, cu);
 		}
 

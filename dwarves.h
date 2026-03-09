@@ -302,6 +302,7 @@ struct cu {
 	uint8_t		 has_addr_info:1;
 	uint8_t		 uses_global_strings:1;
 	uint8_t		 little_endian:1;
+	uint8_t		 producer_clang:1;
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
@@ -1095,6 +1096,7 @@ struct function {
 	uint8_t		 virtuality:2; /* DW_VIRTUALITY_{none,virtual,pure_virtual} */
 	uint8_t		 declaration:1;
 	uint8_t		 btf:1;
+	uint8_t		 signature_changed:1;
 	int32_t		 vtable_entry;
 	struct list_head vtable_node;
 	struct list_head annots;
