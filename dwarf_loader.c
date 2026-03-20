@@ -1227,7 +1227,7 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct conf_l
 		 * DW_OP_stack_value instructs interpreter to pop current value from
 		 * DWARF expression evaluation stack, and thus is not important here.
 		 */
-		if (exprlen > 1 && expr[exprlen - 1].atom == DW_OP_stack_value)
+		if (exprlen == 2 && expr[exprlen - 1].atom == DW_OP_stack_value)
 			exprlen--;
 
 		if (exprlen != 1)
