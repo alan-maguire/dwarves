@@ -1195,12 +1195,14 @@ struct func_info {
 	int skip_idx;
 };
 
+#define	PARM_DEFAULT_FAIL	-1
+
 /* For DW_AT_location 'attr':
  * - if first location is DW_OP_regXX with expected number, return the register;
  *   otherwise save the register for later return
  * - if location DW_OP_entry_value(DW_OP_regXX) with expected number is in the
  *   list, return the register; otherwise save register for later return
- * - otherwise if no register was found for locations, return -1.
+ * - otherwise if no register was found for locations, return PARM_DEFAULT_FAIL.
  */
 static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
 {
@@ -1210,7 +1212,7 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg)
 	size_t exprlen, entry_len;
 	ptrdiff_t offset = 0;
 	int loc_num = -1;
-	int ret = -1;
+	int ret = PARM_DEFAULT_FAIL;
 
 	/* use libdw__lock as dwarf_getlocation(s) has concurrency issues
 	 * when libdw is not compiled with experimental --enable-thread-safety
@@ -1327,7 +1329,7 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 			int expected_reg = cu->register_params[reg_idx];
 			int actual_reg = parameter__reg(&attr, expected_reg);
 
-			if (actual_reg < 0)
+			if (actual_reg == PARM_DEFAULT_FAIL)
 				parm->optimized = 1;
 			else if (expected_reg >= 0 && expected_reg != actual_reg)
 				/* mark parameters that use an unexpected
