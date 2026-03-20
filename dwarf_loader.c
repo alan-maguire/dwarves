@@ -1192,6 +1192,7 @@ static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
 
 struct func_info {
 	bool signature_changed;
+	int skip_idx;
 };
 
 /* For DW_AT_location 'attr':
@@ -1264,6 +1265,7 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 	if (parm != NULL) {
 		bool has_const_value;
 		Dwarf_Attribute attr;
+		int reg_idx;
 
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
@@ -1273,7 +1275,18 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		if (!info->signature_changed) {
 			if (cu->producer_clang || param_idx >= cu->nr_register_params)
 				return parm;
+		} else {
+			/* if true_signature is not enabled, mark parameter as
+			 * unexpected_reg since there is a skipped parameter before.
+			 */
+			if (!conf->true_signature && info->skip_idx) {
+				parm->unexpected_reg = 1;
+				return parm;
+			}
 		}
+		reg_idx = param_idx - info->skip_idx;
+		if (reg_idx >= cu->nr_register_params)
+			return parm;
 		/* Parameters which use DW_AT_abstract_origin to point at
 		 * the original parameter definition (with no name in the DIE)
 		 * are the result of later DWARF generation during compilation
@@ -1311,7 +1324,7 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		parm->has_loc = dwarf_attr(die, DW_AT_location, &attr) != NULL;
 
 		if (parm->has_loc) {
-			int expected_reg = cu->register_params[param_idx];
+			int expected_reg = cu->register_params[reg_idx];
 			int actual_reg = parameter__reg(&attr, expected_reg);
 
 			if (actual_reg < 0)
@@ -1324,8 +1337,10 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 				 * contents.
 				 */
 				parm->unexpected_reg = 1;
-		} else if (has_const_value) {
+		} else if (has_const_value || info->signature_changed) {
 			parm->optimized = 1;
+			if (info->signature_changed)
+				info->skip_idx++;
 		}
 	}
 
