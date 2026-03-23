@@ -106,6 +106,7 @@ struct conf_load {
 	bool			btf_gen_distilled_base;
 	bool			btf_attributes;
 	bool			true_signature;
+	bool			force_cu_merging;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;
 	uint16_t		kabi_prefix_len;

@@ -518,6 +518,18 @@ for pahole and pfunct, no need to use --lang_exclude in all calls to those
 tools, just set that environment variable.
 
 .TP
+.B \-\-force_cu_merging
+Force merging all CUs into one. Use when there are references across CUs.
+
+This happens in some LTO cases and was observed with Rust CUs, where types
+of tags (function parameters, abstract origins for inlines, etc) reference
+types in another CU.
+
+For LTO this is being autodetected and the merging of cus is done
+automatically, but for the Rust case, and maybe others this is needed with the
+current DWARF loading algorithm.
+
+.TP
 .B \-y, \-\-prefix_filter=PREFIX
 Include PREFIXed classes.
 
