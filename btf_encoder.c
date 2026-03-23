@@ -77,9 +77,16 @@ struct btf_encoder_func_annot {
 	int16_t component_idx;
 };
 
+struct elf_function_sym {
+	const char *name;
+	uint64_t addr;
+};
+
 /* state used to do later encoding of saved functions */
 struct btf_encoder_func_state {
 	struct elf_function *elf;
+	struct elf_function_sym *sym;
+	uint64_t addr;
 	uint32_t type_id_off;
 	uint16_t nr_parms;
 	uint16_t nr_annots;
@@ -87,15 +94,11 @@ struct btf_encoder_func_state {
 	uint8_t unexpected_reg:1;
 	uint8_t inconsistent_proto:1;
 	uint8_t uncertain_parm_loc:1;
+	uint8_t reordered_parm:1;
 	uint8_t ambiguous_addr:1;
 	int ret_type_id;
 	struct btf_encoder_func_parm *parms;
 	struct btf_encoder_func_annot *annots;
-};
-
-struct elf_function_sym {
-	const char *name;
-	uint64_t addr;
 };
 
 struct elf_function {
@@ -144,7 +147,8 @@ struct btf_encoder {
 			  skip_encoding_decl_tag,
 			  tag_kfuncs,
 			  gen_distilled_base,
-			  encode_attributes;
+			  encode_attributes,
+			  true_signature;
 	uint32_t	  array_index_id;
 	struct elf_secinfo *secinfo;
 	size_t             seccnt;
@@ -865,10 +869,11 @@ static int32_t btf_encoder__add_func_proto_for_ftype(struct btf_encoder *encoder
 			return -1;
 	}
 
-	++param_idx;
-	if (ftype->unspec_parms)
+	if (ftype->unspec_parms) {
+		++param_idx;
 		if (btf_encoder__add_func_param(encoder, NULL, 0, param_idx == nr_params))
 			return -1;
+	}
 
 	return id;
 }
@@ -895,7 +900,7 @@ static int32_t btf_encoder__add_func_proto_for_state(struct btf_encoder *encoder
 	for (param_idx = 0; param_idx < nr_params; param_idx++) {
 		p = &state->parms[param_idx];
 		name = btf__name_by_offset(btf, p->name_off);
-		is_last = param_idx == nr_params;
+		is_last = param_idx == (nr_params - 1);
 
 		/* adding BTF data may result in a move of the
 		 * name string memory, so make a temporary copy.
@@ -1213,7 +1218,7 @@ static bool str_contains_non_fn_suffix(const char *str) {
 		".cold",
 		".part"
 	};
-	char *suffix = strchr(str, '.');
+	const char *suffix = strchr(str, '.');
 	int i;
 
 	if (!suffix)
@@ -1258,6 +1263,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	if (!state)
 		return -ENOMEM;
 
+	state->addr = function__addr(fn);
 	state->elf = func;
 	state->nr_parms = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
 	state->ret_type_id = ftype->tag.type == 0 ? 0 : encoder->type_id_off + ftype->tag.type;
@@ -1268,13 +1274,36 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 			goto out;
 		}
 	}
+	if (encoder->true_signature && state->addr) {
+		int i;
+
+		for (i = 0; i < func->sym_cnt; i++) {
+			if (state->addr != func->syms[i].addr)
+				continue;
+			/* Only need to record address for '.'-suffixed
+			 * functions, since we only currently need true
+			 * signatures for them.
+			 */
+			if (!strchr(func->syms[i].name, '.'))
+				continue;
+			state->sym = &func->syms[i];
+			break;
+		}
+	}
 	state->inconsistent_proto = ftype->inconsistent_proto;
 	state->unexpected_reg = ftype->unexpected_reg;
 	state->optimized_parms = ftype->optimized_parms;
 	state->uncertain_parm_loc = ftype->uncertain_parm_loc;
+	state->reordered_parm = ftype->reordered_parm;
 	ftype__for_each_parameter(ftype, param) {
-		const char *name = parameter__name(param) ?: "";
+		const char *name;
 
+		/* No location info/optimized + reordered means optimized out. */
+		if (ftype->reordered_parm && (!param->has_loc || param->optimized)) {
+			state->nr_parms--;
+			continue;
+		}
+		name = parameter__name(param) ?: "";
 		str_off = btf__add_str(btf, name);
 		if (str_off < 0) {
 			err = str_off;
@@ -1363,6 +1392,9 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 
 	btf_fnproto_id = btf_encoder__add_func_proto_for_state(encoder, state);
 	name = func->name;
+	if (encoder->true_signature && state->sym)
+		name = state->sym->name;
+
 	if (btf_fnproto_id >= 0)
 		btf_fn_id = btf_encoder__add_ref_type(encoder, BTF_KIND_FUNC, btf_fnproto_id,
 						      name, false);
@@ -1441,7 +1473,7 @@ static int saved_functions_combine(struct btf_encoder *encoder,
 				   struct btf_encoder_func_state *a,
 				   struct btf_encoder_func_state *b)
 {
-	uint8_t optimized, unexpected, inconsistent, uncertain_parm_loc;
+	uint8_t optimized, unexpected, inconsistent, uncertain_parm_loc, reordered_parm;
 
 	if (a->elf != b->elf)
 		return 1;
@@ -1450,12 +1482,14 @@ static int saved_functions_combine(struct btf_encoder *encoder,
 	unexpected = a->unexpected_reg | b->unexpected_reg;
 	inconsistent = a->inconsistent_proto | b->inconsistent_proto;
 	uncertain_parm_loc = a->uncertain_parm_loc | b->uncertain_parm_loc;
-	if (!unexpected && !inconsistent && !funcs__match(encoder, a, b))
+	reordered_parm = a->reordered_parm | b->reordered_parm;
+	if (!unexpected && !inconsistent && !reordered_parm && !funcs__match(encoder, a, b))
 		inconsistent = 1;
 	a->optimized_parms = b->optimized_parms = optimized;
 	a->unexpected_reg = b->unexpected_reg = unexpected;
 	a->inconsistent_proto = b->inconsistent_proto = inconsistent;
 	a->uncertain_parm_loc = b->uncertain_parm_loc = uncertain_parm_loc;
+	a->reordered_parm = b->reordered_parm = reordered_parm;
 
 	return 0;
 }
@@ -1477,6 +1511,68 @@ static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
 	encoder->func_states.cap = 0;
 }
 
+/*
+ * Returns: 1 if true signature added, 0 if not and < 0 on error.
+ */
+static int btf_encoder__add_true_signature(struct btf_encoder *encoder,
+					   int idx)
+{
+	struct btf_encoder_func_state *saved_fns = encoder->func_states.array;
+	struct btf_encoder_func_state *state = &saved_fns[idx];
+	int nr_saved_fns = encoder->func_states.cnt;
+	int err, i;
+
+	/*
+	 * Add true signatures for case where we have an exact
+	 * symbol match by address from DWARF->ELF and have a
+	 * "." suffixed name.
+	 */
+	for (i = idx; i < nr_saved_fns; i++) {
+		struct btf_encoder_func_state *true_state = &saved_fns[i];
+
+		if (state->elf != true_state->elf)
+			return 0;
+		if (!true_state->sym)
+			continue;
+		/*
+		 * Unexpected reg, uncertain parm loc and
+		 * ambiguous address mean we cannot trust fentry.
+		 */
+		if (true_state->unexpected_reg ||
+		    true_state->uncertain_parm_loc ||
+		    true_state->ambiguous_addr)
+			continue;
+		err = btf_encoder__add_func(encoder, true_state);
+		if (err < 0)
+			return err;
+		return 1;
+	}
+	return 0;
+}
+
+static struct btf_encoder_func_state *btf_encoder__select_canonical_state(struct btf_encoder_func_state *combined_states,
+									  int combined_cnt)
+{
+	int i, j;
+
+	/*
+	 * The same elf_function is shared amongst combined functions,
+	 * as per saved_functions_combine().
+	 */
+	struct elf_function *elf = combined_states[0].elf;
+
+	for (i = 0; i < combined_cnt; i++) {
+		struct btf_encoder_func_state *state = &combined_states[i];
+
+		for (j = 0; j < elf->sym_cnt; j++) {
+			if (state->addr == elf->syms[j].addr)
+				return state;
+		}
+	}
+
+	return &combined_states[0];
+}
+
 static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder, bool skip_encoding_inconsistent_proto)
 {
 	struct btf_encoder_func_state *saved_fns = encoder->func_states.array;
@@ -1493,7 +1589,7 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder, bool skip_e
 
 	for (i = 0; i < nr_saved_fns; i = j) {
 		struct btf_encoder_func_state *state = &saved_fns[i];
-		bool add_to_btf = !skip_encoding_inconsistent_proto;
+		char *skip_reason = NULL;
 
 		/* Compare across sorted functions that match by name/prefix;
 		 * share inconsistent/unexpected reg state between them.
@@ -1503,20 +1599,54 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder, bool skip_e
 		while (j < nr_saved_fns && saved_functions_combine(encoder, &saved_fns[i], &saved_fns[j]) == 0)
 			j++;
 
+		/* Add true signatures for case where we have an exact
+		 * symbol match by address from DWARF->ELF and have a
+		 * "." suffixed name.
+		 */
+		if (encoder->true_signature) {
+			err = btf_encoder__add_true_signature(encoder, i);
+			switch (err) {
+			case 0:
+				break;
+			case 1:
+				/* If true signature was added, skip below */
+				continue;
+			default:
+				goto out;
+			}
+		}
+
 		/* do not exclude functions with optimized-out parameters; they
 		 * may still be _called_ with the right parameter values, they
 		 * just do not _use_ them.  Only exclude functions with
 		 * unexpected register use, multiple inconsistent prototypes or
 		 * uncertain parameters location
 		 */
-		add_to_btf |= !state->unexpected_reg && !state->inconsistent_proto && !state->uncertain_parm_loc && !state->elf->ambiguous_addr;
-
+		if (state->unexpected_reg)
+			skip_reason = "unexpected register usage for parameter\n";
+		if (skip_encoding_inconsistent_proto && state->inconsistent_proto)
+			skip_reason = "inconsistet prototype\n";
 		if (state->uncertain_parm_loc)
-			btf_encoder__log_func_skip(encoder, saved_fns[i].elf,
-					"uncertain parameter location\n",
-					0, 0);
+			skip_reason = "uncertain parameter location\n";
+		if (state->reordered_parm)
+			skip_reason = "reordered parameters\n";
+		if (state->elf->ambiguous_addr)
+			skip_reason = "ambiguous address\n";
 
-		if (add_to_btf) {
+		if (skip_reason) {
+			btf_encoder__log_func_skip(encoder, saved_fns[i].elf,
+						   skip_reason, 0, 0);
+		} else {
+			/*
+			 * We're to add the current function within
+			 * BTF. Although, from all functions that have
+			 * possibly been combined via
+			 * saved_functions_combine(), ensure to only
+			 * select and emit BTF for the most canonical
+			 * function definition.
+			 */
+			if (j - i > 1)
+				state = btf_encoder__select_canonical_state(state, j - i);
 			if (is_kfunc_state(state))
 				err = btf_encoder__add_bpf_kfunc(encoder, state);
 			else
@@ -2572,6 +2702,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		encoder->tag_kfuncs	 = conf_load->btf_decl_tag_kfuncs;
 		encoder->gen_distilled_base = conf_load->btf_gen_distilled_base;
 		encoder->encode_attributes = conf_load->btf_attributes;
+		encoder->true_signature = conf_load->true_signature;
 		encoder->verbose	 = verbose;
 		encoder->has_index_type  = false;
 		encoder->need_index_type = false;
