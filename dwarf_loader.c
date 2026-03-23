@@ -1943,6 +1943,8 @@ out_delete:
 	return NULL;
 }
 
+static struct tag *die__create_new_function(Dwarf_Die *die, struct cu *cu, struct conf_load *conf);
+
 static struct tag *die__create_new_enumeration(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	Dwarf_Die child;
@@ -1964,18 +1966,38 @@ static struct tag *die__create_new_enumeration(Dwarf_Die *die, struct cu *cu, st
 
 	die = &child;
 	do {
-		struct enumerator *enumerator;
+		switch (dwarf_tag(die)) {
+		case DW_TAG_enumerator: {
+			struct enumerator *enumerator = enumerator__new(die, cu, conf);
 
-		if (dwarf_tag(die) != DW_TAG_enumerator) {
+			if (enumerator == NULL)
+				goto out_delete;
+
+			enumeration__add(enumeration, enumerator);
+			cu__hash(cu, &enumerator->tag);
+		}
+			continue;
+		case DW_TAG_subprogram: {
+			struct tag *tag = die__create_new_function(die, cu, conf);
+			uint32_t id;
+
+			if (tag == NULL)
+				goto out_delete;
+
+			if (cu__add_tag(cu, tag, &id) < 0) {
+				tag__delete(tag, cu);
+				goto out_delete;
+			}
+
+			cu__hash(cu, tag);
+			struct dwarf_tag *dtag = tag__dwarf(tag);
+			dtag->small_id = id;
+			break;
+		}
+		default:
 			cu__tag_not_handled(cu, die);
 			continue;
 		}
-		enumerator = enumerator__new(die, cu, conf);
-		if (enumerator == NULL)
-			goto out_delete;
-
-		enumeration__add(enumeration, enumerator);
-		cu__hash(cu, &enumerator->tag);
 	} while (dwarf_siblingof(die, die) == 0);
 out:
 	return &enumeration->namespace.tag;
