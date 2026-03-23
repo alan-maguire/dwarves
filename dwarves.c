@@ -428,6 +428,7 @@ void __type__init(struct type *type)
 	INIT_LIST_HEAD(&type->type_enum);
 	INIT_LIST_HEAD(&type->template_type_params);
 	INIT_LIST_HEAD(&type->template_value_params);
+	INIT_LIST_HEAD(&type->variant_parts);
 	type->template_parameter_pack = NULL;
 	type->sizeof_member = NULL;
 	type->member_prefix = NULL;
@@ -1364,6 +1365,11 @@ void type__add_template_type_param(struct type *type, struct template_type_param
 void type__add_template_value_param(struct type *type, struct template_value_param *tvparam)
 {
 	list_add_tail(&tvparam->tag.node, &type->template_value_params);
+}
+
+void type__add_variant_part(struct type *type, struct variant_part *vpart)
+{
+	list_add_tail(&vpart->tag.node, &type->variant_parts);
 }
 
 struct class_member *type__last_member(struct type *type)
