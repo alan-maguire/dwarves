@@ -1257,15 +1257,21 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	struct btf *btf = encoder->btf;
 	struct llvm_annotation *annot;
 	struct parameter *param;
-	uint8_t param_idx = 0;
+	uint8_t param_idx = 0, skip_idx = 0;
 	int str_off, err = 0;
 
 	if (!state)
 		return -ENOMEM;
 
+	if (encoder->true_signature && encoder->cu->producer_clang) {
+		ftype__for_each_parameter(ftype, param) {
+			if (param->optimized) skip_idx++;
+		}
+	}
+
 	state->addr = function__addr(fn);
 	state->elf = func;
-	state->nr_parms = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
+	state->nr_parms = ftype->nr_parms - skip_idx + (ftype->unspec_parms ? 1 : 0);
 	state->ret_type_id = ftype->tag.type == 0 ? 0 : encoder->type_id_off + ftype->tag.type;
 	if (state->nr_parms > 0) {
 		state->parms = zalloc(state->nr_parms * sizeof(*state->parms));
@@ -1297,14 +1303,34 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	state->reordered_parm = ftype->reordered_parm;
 	ftype__for_each_parameter(ftype, param) {
 		const char *name;
+		char *final_name = NULL;
 
 		/* No location info/optimized + reordered means optimized out. */
 		if (ftype->reordered_parm && (!param->has_loc || param->optimized)) {
 			state->nr_parms--;
 			continue;
 		}
-		name = parameter__name(param) ?: "";
+		if (encoder->true_signature && encoder->cu->producer_clang && param->optimized)
+			continue;
+
+		name = parameter__name(param);
+		if (!name) {
+			name = "";
+		} else if (param->true_sig_member_name) {
+			/* Non-null param->true_sig_member_name indicates that the parameter
+			 * name is <parameter_name>__<field_name>.
+			 */
+			if (asprintf(&final_name, "%s__%s", name, param->true_sig_member_name) == -1) {
+				err = -ENOMEM;
+				goto out;
+			}
+			name = final_name;
+		}
+
 		str_off = btf__add_str(btf, name);
+		if (final_name)
+			free(final_name);
+
 		if (str_off < 0) {
 			err = str_off;
 			goto out;
