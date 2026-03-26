@@ -1190,9 +1190,39 @@ static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
 	return ret;
 }
 
+/* Max 20 register parameters, considering some parameters may be optimized out.  */
+#define	MAX_PRESCAN_PARAMS	20
+
 struct func_info {
 	bool signature_changed;
+	int nr_params;
+	int param_start_regs[MAX_PRESCAN_PARAMS];
 };
+
+/* Get the first DW_OP_X (should be a register) from a parameter's DW_AT_location. */
+static int parameter__peek_first_reg(Dwarf_Die *die)
+{
+	Dwarf_Attribute attr;
+	if (dwarf_attr(die, DW_AT_location, &attr) == NULL)
+		return -1;
+
+	Dwarf_Addr base, start, end;
+	Dwarf_Op *expr;
+	size_t exprlen;
+	ptrdiff_t offset = 0;
+
+	pthread_mutex_lock(&libdw__lock);
+	offset = __dwarf_getlocations(&attr, offset, &base, &start, &end, &expr, &exprlen);
+	pthread_mutex_unlock(&libdw__lock);
+
+	if (offset <= 0 || exprlen == 0)
+		return -1;
+
+	if (expr[0].atom >= DW_OP_reg0 && expr[0].atom <= DW_OP_reg31)
+		return expr[0].atom;
+
+	return -1;
+}
 
 /* For DW_AT_location 'attr':
  * - if first location is DW_OP_regXX with expected number, return the register;
@@ -2425,6 +2455,43 @@ out_enomem:
 	return -ENOMEM;
 }
 
+/* Pre-scan all formal parameters to collect their starting registers.
+ * This allows look-ahead when processing parameters sequentially, so that
+ * a parameter can check the next parameter's register to determine if the
+ * ABI register layout is preserved despite partial optimization.
+ * For example, for a function like below:
+ *  struct t { long f1; long f2; };
+ *  __attribute__((noinline)) static long foo(struct t a, struct t b)
+ *  {
+ *      return a.f1 + b.f1 + b.f2;
+ *  }
+ * If dwarf has parameter 'a' at aarch64 register W0, and 'b' at register W2,
+ * even compiler could optimize 'a' to 'a.f1'. To conform to ABI, the
+ * parameter 'a' will keep 'struct t' type.
+ */
+static void func_info__prescan_params(struct func_info *info, Dwarf_Die *die)
+{
+	Dwarf_Die child;
+	int idx = 0;
+
+	if (!info->signature_changed)
+		return;
+
+	if (!dwarf_haschildren(die) || dwarf_child(die, &child) != 0)
+		return;
+
+	do {
+		if (dwarf_tag(&child) != DW_TAG_formal_parameter)
+			continue;
+		if (idx >= MAX_PRESCAN_PARAMS)
+			break;
+		info->param_start_regs[idx] = parameter__peek_first_reg(&child);
+		idx++;
+	} while (dwarf_siblingof(&child, &child) == 0);
+
+	info->nr_params = idx;
+}
+
 static struct tag *die__create_new_function(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct function *function = function__new(die, cu, conf);
@@ -2432,6 +2499,7 @@ static struct tag *die__create_new_function(Dwarf_Die *die, struct cu *cu, struc
 
 	if (function != NULL) {
 		info.signature_changed = function__signature_changed(function, die);
+		func_info__prescan_params(&info, die);
 
 		if (die__process_function(die, &function->proto, &function->lexblock, cu, conf, &info) != 0) {
 			function__delete(function, cu);
