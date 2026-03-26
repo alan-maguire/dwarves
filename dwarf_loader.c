@@ -1195,9 +1195,61 @@ static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
 
 struct func_info {
 	bool signature_changed;
+	int skip_idx;
 	int nr_params;
 	int param_start_regs[MAX_PRESCAN_PARAMS];
 };
+
+static int __get_type_byte_size(Dwarf_Die *die, struct cu *cu)
+{
+	Dwarf_Attribute attr;
+	if (dwarf_attr(die, DW_AT_type, &attr) == NULL)
+		return 0;
+
+	Dwarf_Die type_die;
+	if (dwarf_formref_die(&attr, &type_die) == NULL)
+		return 0;
+
+	/* A type does not have byte_size.
+	 * 0x000dac83: DW_TAG_formal_parameter
+			 DW_AT_location        (indexed (0x385) loclist = 0x00016175:
+			   [0xffff800080098cb0, 0xffff800080098cb4): DW_OP_breg8 W8+0
+			   [0xffff800080098cb4, 0xffff800080098ff4): DW_OP_breg31 WSP+16, DW_OP_deref
+			   [0xffff800080099054, 0xffff80008009908c): DW_OP_breg31 WSP+16, DW_OP_deref)
+			 DW_AT_name    ("ubuf")
+			 DW_AT_decl_file       ("/home/yhs/work/bpf-next/arch/arm64/kernel/ptrace.c")
+			 DW_AT_decl_line       (886)
+			 DW_AT_type    (0x000d467e "const void *")
+
+	  * 0x000d467e: DW_TAG_pointer_type
+			  DW_AT_type      (0x000c4320 "const void")
+
+	  * 0x000c4320: DW_TAG_const_type
+	  */
+	if (dwarf_tag(&type_die) == DW_TAG_pointer_type)
+		return cu->addr_size;
+
+	uint64_t bsize = attr_numeric(&type_die, DW_AT_byte_size);
+	if (bsize == 0)
+		return __get_type_byte_size(&type_die, cu);
+
+	return bsize;
+}
+
+static int get_type_byte_size(Dwarf_Die *die, struct cu *cu)
+{
+	int byte_size = 0;
+
+	Dwarf_Attribute attr;
+	if (dwarf_attr(die, DW_AT_abstract_origin, &attr)) {
+		Dwarf_Die origin;
+		if (dwarf_formref_die(&attr, &origin))
+			byte_size = __get_type_byte_size(&origin, cu);
+	} else {
+		byte_size = __get_type_byte_size(die, cu);
+	}
+	return byte_size;
+}
 
 /* Get the first DW_OP_X (should be a register) from a parameter's DW_AT_location. */
 static int parameter__peek_first_reg(Dwarf_Die *die)
@@ -1292,8 +1344,9 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
 	if (parm != NULL) {
-		bool has_const_value;
+		bool has_const_value, true_sig_enabled;
 		Dwarf_Attribute attr;
+		int reg_idx;
 
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
@@ -1303,8 +1356,10 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		if (!info->signature_changed) {
 			if (cu->producer_clang || param_idx >= cu->nr_register_params)
 				return parm;
-		} else if (param_idx >= cu->nr_register_params) {
-			return parm;
+		} else {
+			reg_idx = param_idx - info->skip_idx;
+			if (reg_idx >= cu->nr_register_params)
+				return parm;
 		}
 
 		/* Parameters which use DW_AT_abstract_origin to point at
@@ -1342,9 +1397,10 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		 */
 		has_const_value = dwarf_attr(die, DW_AT_const_value, &attr) != NULL;
 		parm->has_loc = dwarf_attr(die, DW_AT_location, &attr) != NULL;
+		true_sig_enabled = conf->true_signature && info->signature_changed;
 
 		if (parm->has_loc) {
-			int expected_reg = cu->register_params[param_idx];
+			int expected_reg = cu->register_params[reg_idx];
 			int actual_reg = parameter__reg(&attr, expected_reg);
 
 			if (actual_reg < 0)
@@ -1357,8 +1413,35 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 				 * contents.
 				 */
 				parm->unexpected_reg = 1;
-		} else if (has_const_value) {
+		} else if (has_const_value && !cu->producer_clang) {
 			parm->optimized = 1;
+		} else if (true_sig_enabled) {
+			int byte_size, num_regs, next_reg_idx;
+
+			if (param_idx + 1 < info->nr_params) {
+				int next_start = info->param_start_regs[param_idx + 1];
+				if (next_start >= 0) {
+					/* check whether we should preserve the argument or not */
+					byte_size = get_type_byte_size(die, cu);
+					/* byte_size 0 should not happen. */
+					if (!byte_size) {
+						parm->unexpected_reg = 1;
+						return parm;
+					}
+
+					num_regs = (byte_size + cu->addr_size - 1) / cu->addr_size;
+					next_reg_idx = reg_idx + num_regs;
+					if (next_reg_idx < cu->nr_register_params &&
+					    next_start == cu->register_params[next_reg_idx]) {
+						if (byte_size > cu->addr_size)
+							info->skip_idx--;
+						return parm;
+					}
+				}
+			}
+
+			parm->optimized = 1;
+			info->skip_idx++;
 		}
 	}
 
