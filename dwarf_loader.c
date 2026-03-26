@@ -1100,6 +1100,16 @@ static void arch__set_register_params(const GElf_Ehdr *ehdr, struct cu *cu)
 	}
 }
 
+static bool arch__agg_use_two_regs(const GElf_Ehdr *ehdr)
+{
+	switch (ehdr->e_machine) {
+	case EM_S390:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static struct template_type_param *template_type_param__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct template_type_param *ttparm = tag__alloc(cu, sizeof(*ttparm));
@@ -3557,6 +3567,7 @@ static int cu__set_common(struct cu *cu, struct conf_load *conf,
 
 	cu->little_endian = ehdr.e_ident[EI_DATA] == ELFDATA2LSB;
 	cu->nr_register_params = arch__nr_register_params(&ehdr);
+	cu->agg_use_two_regs = arch__agg_use_two_regs(&ehdr);
 	arch__set_register_params(&ehdr, cu);
 	return 0;
 }
