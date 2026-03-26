@@ -1204,6 +1204,8 @@ static ptrdiff_t __dwarf_getlocations(Dwarf_Attribute *attr,
 #define	PARM_UNEXPECTED		-2
 #define	PARM_OPTIMIZED_OUT	-3
 #define	PARM_CONTINUE		-4
+#define	PARM_TWO_ADDR_LEN	-5
+#define	PARM_TO_BE_IMPROVED	-6
 
 /* Max 20 register parameters, considering some parameters may be optimized out.  */
 #define	MAX_PRESCAN_PARAMS	20
@@ -1291,7 +1293,47 @@ static int parameter__peek_first_reg(Dwarf_Die *die)
 	return -1;
 }
 
-static int parameter__multi_exprs(Dwarf_Op *expr, int loc_num)
+/* Traverse the parameter type until finding the member type which has expected
+ * struct type offset.
+ */
+static Dwarf_Die *get_member_with_offset(Dwarf_Die *die, int offset, Dwarf_Die *member_die)
+{
+	Dwarf_Attribute attr;
+	if (dwarf_attr(die, DW_AT_type, &attr) == NULL)
+		return NULL;
+
+	Dwarf_Die type_die;
+	if (dwarf_formref_die(&attr, &type_die) == NULL)
+		return NULL;
+
+	uint64_t bsize = attr_numeric(&type_die, DW_AT_byte_size);
+	if (bsize == 0)
+		return get_member_with_offset(&type_die, offset, member_die);
+
+	if (dwarf_tag(&type_die) != DW_TAG_structure_type)
+		return NULL;
+
+	if (!dwarf_haschildren(&type_die) || dwarf_child(&type_die, member_die) != 0)
+		return NULL;
+	do {
+		if (dwarf_tag(member_die) != DW_TAG_member)
+			continue;
+
+		int off = attr_numeric(member_die, DW_AT_data_bit_offset);
+		if (off == offset * 8)
+			return member_die;
+	} while (dwarf_siblingof(member_die, member_die) == 0);
+
+	return NULL;
+}
+
+/* For two address length case, first_half and second_half represents the parameter.
+ * The first_half and second_half accumulates field information across possible multiple
+ * location lists.
+ */
+static int parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu, size_t exprlen,
+				  Dwarf_Die *die, int expected_reg, int byte_size,
+				  unsigned long *first_half, unsigned long *second_half, int *ret)
 {
 	switch (expr[0].atom) {
 	case DW_OP_lit0 ... DW_OP_lit31:
@@ -1302,7 +1344,167 @@ static int parameter__multi_exprs(Dwarf_Op *expr, int loc_num)
 		return PARM_OPTIMIZED_OUT;
 	}
 
+	if (byte_size <= cu->addr_size || !cu->agg_use_two_regs) {
+		/* parameter_size <= cu->addr_size */
+		switch (expr[0].atom) {
+		case DW_OP_reg0 ... DW_OP_reg31:
+			if (loc_num != 0)
+				break;
+			*ret = expr[0].atom;
+			if (*ret == expected_reg)
+				return *ret;
+			break;
+		case DW_OP_breg0 ... DW_OP_breg31:
+			if (loc_num != 0)
+				break;
+			bool has_op_stack_value = false;
+			for (int i = 1; i < exprlen; i++) {
+				if (expr[i].atom == DW_OP_stack_value) {
+					has_op_stack_value = true;
+					break;
+				}
+			}
+			if (!has_op_stack_value)
+				break;
+			/* The existence of DW_OP_stack_value means that
+			 * DW_OP_bregX register is used as value.
+			 */
+			*ret = expr[0].atom - DW_OP_breg0 + DW_OP_reg0;
+			if (*ret == expected_reg)
+				return *ret;
+		}
+	} else {
+		/* cu->addr < parameter_size <= cu->addr * 2
+		 * first_half encodes field starts for the first register.
+		 * second_half encodes field starts for the second register.
+		 *
+		 * For example:
+		 *   loclist 1: DW_OP_reg5 RDI, DW_OP_piece 0x8, DW_OP_reg4 RSI, DW_OP_piece 0x1
+		 *   loclist 2: DW_OP_piece 0x8, DW_OP_reg4 RSI, DW_OP_piece 0x1
+		 *   loclist 3: DW_OP_piece 0x8, DW_OP_reg4 RSI, DW_OP_piece 0x1)
+		 *
+		 * After iterating all the above three location lists (see PARM_CONTINUE below),
+		 * first_half encodes as 0x1 and second_half encodes as 0x1. The 'ret' value will
+		 * encode the first used register which is RDI. Each bit in first_half/second_half
+		 * represents a member field.
+		 *
+		 * Another example:
+		 *   loclist 1: DW_OP_reg5 RDI, DW_OP_piece 0x4
+		 *   loclist 2: DW_OP_piece 0x4, DW_OP_reg4 RDI, DW_OP_piece 0x4
+		 *
+		 * After iterating all the above two location lists, first_half encodes 0x11.
+		 * After loclist 1, first_half encoding is 0x1. After loclist 2, first_half encoding is 0x11.
+		 * second_half is 0. The 'ret' value is RDI.
+		 */
+		int off = 0;
+		for (int i = 0; i < exprlen; i++) {
+			if (expr[i].atom == DW_OP_piece) {
+				int num = expr[i].number;
+				if (i == 0) {
+					off = num;
+					continue;
+				}
+				if (off < cu->addr_size) (*first_half) |= (1 << off);
+				else (*second_half) |= (1 << (off - cu->addr_size));
+				off += num;
+			} else if (expr[i].atom >= DW_OP_reg0 && expr[i].atom <= DW_OP_reg31) {
+				if (off < cu->addr_size)
+					*ret = expr[i].atom;
+				else if (*ret < 0)
+					*ret = expr[i].atom;
+			}
+			/* FIXME: not handling DW_OP_bregX yet since we do not have
+			 * a use case for it yet for linux kernel.
+			 */
+		}
+	}
+
 	return PARM_CONTINUE;
+}
+
+/* The first_half and second_half, computed in parameter__multi_exprs(), are handled here. */
+static int parameter__handle_two_addr_len(int expected_reg, unsigned long first_half, unsigned long second_half,
+					  int ret, Dwarf_Die *die, struct conf_load *conf, struct cu *cu,
+					  struct parameter *parm, int param_idx, int reg_idx, int byte_size,
+					  struct func_info *info)
+{
+	if (!first_half && !second_half)
+		return ret;
+
+	if (ret != expected_reg)
+		return ret;
+
+	if (!conf->true_signature)
+		return PARM_DEFAULT_FAIL;
+
+	/* Both halves are used based on dwarf */
+	if (first_half && second_half)
+		return PARM_TWO_ADDR_LEN;
+
+	/* Only one half is used. Check if the next parameter's starting register
+	 * indicates the ABI still reserves the full register space for this
+	 * parameter. If so, the compiler only eliminated the dead half but the
+	 * register layout is preserved — keep the original source type.
+	 *
+	 * Use register_params[] array for the expected next register since
+	 * DW_OP_reg numbers are not necessarily sequential across architectures.
+	 */
+	if (param_idx + 1 < info->nr_params) {
+		int next_start = info->param_start_regs[param_idx + 1];
+
+		if (next_start >= 0) {
+			int num_regs = (byte_size + cu->addr_size - 1) / cu->addr_size;
+			int next_reg_idx = reg_idx + num_regs;
+
+			if (next_reg_idx < cu->nr_register_params &&
+			    next_start == cu->register_params[next_reg_idx])
+				return PARM_TWO_ADDR_LEN;
+		}
+	}
+
+	/* FIXME: parm->name may be NULL due to abstract origin. We do not want to
+	 * update abstract origin as the type in abstract origin may be used
+	 * in some other places. We could remove abstract origin in this parameter
+	 * and add name and type in parameter itself. Right now, for current bpf-next
+	 * repo, we do not have instances below where parm->name is NULL for x86_64 arch.
+	 */
+	if (!parm->name)
+		return PARM_TO_BE_IMPROVED;
+
+	/* FIXME: Only support single field now so we can have a good parameter name and
+	 * type for it. For more than one field, another option could be named as
+	 * <parameter_name>__first_half or <parameter_name>__second_half, but it is not
+	 * that intuitive.
+	 */
+	if (__builtin_popcountll(first_half) >= 2 || __builtin_popcountll(second_half) >= 2)
+		return PARM_TO_BE_IMPROVED;
+
+	int field_offset;
+	if (__builtin_popcountll(first_half) == 1)
+		field_offset = __builtin_ctzll(first_half);
+	else
+		field_offset = cu->addr_size + __builtin_ctzll(second_half);
+
+	/* FIXME: Only struct type is supported. */
+	Dwarf_Die member_die;
+	if (!get_member_with_offset(die, field_offset, &member_die))
+		return PARM_TO_BE_IMPROVED;
+
+	/* FIXME: cannot get a proper member_name, e.g. if the member type is a union. */
+	const char *member_name = attr_string(&member_die, DW_AT_name, conf);
+	if (!member_name)
+		return PARM_TO_BE_IMPROVED;
+
+	/* true_sig_member_name is the member name which will be used for later btf name
+	 * like <parameter_name>__<member_name>.
+	 */
+	parm->true_sig_member_name = member_name;
+
+	struct tag *tag = &parm->tag;
+	struct dwarf_tag *dtag = tag__dwarf(tag);
+	dwarf_tag__set_attr_type(dtag, type, &member_die, DW_AT_type);
+
+	return ret;
 }
 
 /* For DW_AT_location 'attr':
@@ -1313,15 +1515,18 @@ static int parameter__multi_exprs(Dwarf_Op *expr, int loc_num)
  * - otherwise if no register was found for locations, return PARM_DEFAULT_FAIL.
  */
 static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct conf_load *conf,
-			  struct func_info *info)
+			  struct func_info *info, struct cu *cu, Dwarf_Die *die,
+			  struct parameter *parm, int param_idx, int reg_idx)
 {
 	Dwarf_Addr base, start, end;
 	Dwarf_Op *expr, *entry_ops;
 	Dwarf_Attribute entry_attr;
 	size_t exprlen, entry_len;
 	ptrdiff_t offset = 0;
+	int byte_size = 0;
 	int loc_num = -1;
 	int ret = PARM_DEFAULT_FAIL;
+	unsigned long first_half = 0, second_half = 0;
 
 	/* use libdw__lock as dwarf_getlocation(s) has concurrency issues
 	 * when libdw is not compiled with experimental --enable-thread-safety
@@ -1341,8 +1546,17 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct conf_l
 			if (!info->signature_changed || !conf->true_signature)
 				continue;
 
+			if (!byte_size)
+				byte_size = get_type_byte_size(die, cu);
+			/* This should not happen. */
+			if (!byte_size) {
+				ret = PARM_UNEXPECTED;
+				goto out;
+			}
+
 			int res;
-			res = parameter__multi_exprs(expr, loc_num);
+			res = parameter__multi_exprs(expr, loc_num, cu, exprlen, die, expected_reg,
+						     byte_size, &first_half, &second_half, &ret);
 			if (res == PARM_CONTINUE)
 				continue;
 			ret = res;
@@ -1391,6 +1605,11 @@ static int parameter__reg(Dwarf_Attribute *attr, int expected_reg, struct conf_l
 			break;
 		}
 	}
+
+	ret = parameter__handle_two_addr_len(expected_reg, first_half, second_half,
+					     ret, die, conf, cu, parm, param_idx, reg_idx,
+					     byte_size, info);
+
 out:
 	pthread_mutex_unlock(&libdw__lock);
 	return ret;
@@ -1417,8 +1636,6 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 				return parm;
 		} else {
 			reg_idx = param_idx - info->skip_idx;
-			if (reg_idx >= cu->nr_register_params)
-				return parm;
 		}
 
 		/* Parameters which use DW_AT_abstract_origin to point at
@@ -1459,15 +1676,23 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu,
 		true_sig_enabled = conf->true_signature && info->signature_changed;
 
 		if (parm->has_loc) {
+			if (reg_idx >= cu->nr_register_params)
+				return parm;
+
 			int expected_reg = cu->register_params[reg_idx];
-			int actual_reg = parameter__reg(&attr, expected_reg, conf, info);
+			int actual_reg = parameter__reg(&attr, expected_reg, conf, info, cu, die,
+							parm, param_idx, reg_idx);
 
 			if (actual_reg == PARM_DEFAULT_FAIL) {
 				parm->optimized = 1;
 			} else if (actual_reg == PARM_OPTIMIZED_OUT) {
 				parm->optimized = 1;
 				info->skip_idx++;
-			} else if (actual_reg == PARM_UNEXPECTED || (expected_reg >= 0 && expected_reg != actual_reg)) {
+			} else if (actual_reg == PARM_TWO_ADDR_LEN) {
+				/* account for parameter with two registers */
+				info->skip_idx--;
+			} else if (actual_reg == PARM_UNEXPECTED || actual_reg == PARM_TO_BE_IMPROVED ||
+				   (expected_reg >= 0 && expected_reg != actual_reg)) {
 				/* mark parameters that use an unexpected
 				 * register to hold a parameter; these will
 				 * be problematic for users of BTF as they
