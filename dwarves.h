@@ -101,6 +101,7 @@ struct conf_load {
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
 	bool			btf_attributes;
+	bool			true_signature;
 	uint8_t			hashtable_bits;
 	uint8_t			max_hashtable_bits;
 	uint16_t		kabi_prefix_len;
@@ -944,6 +945,7 @@ struct parameter {
 	uint8_t optimized:1;
 	uint8_t unexpected_reg:1;
 	uint8_t has_loc:1;
+	uint8_t idx;
 };
 
 static inline struct parameter *tag__parameter(const struct tag *tag)
@@ -1023,6 +1025,7 @@ struct ftype {
 	uint8_t		 processed:1;
 	uint8_t		 inconsistent_proto:1;
 	uint8_t		 uncertain_parm_loc:1;
+	uint8_t		 reordered_parm:1;
 	struct list_head template_type_params;
 	struct list_head template_value_params;
 	struct template_parameter_pack *template_parameter_pack;
