@@ -13,17 +13,21 @@ trap cleanup EXIT
 
 title_log "Check that pfunct can print btf_decl_tags read from BTF."
 
-# gcc now also supports decl tags as of gcc commit 43dcea48b8c,
-# in upstream version 16.
-# UPTODO: add a check here for that.
+# gcc 16+ supports decl tags via DW_TAG_GNU_annotation (gcc commit ac7027f180b).
+# Use gcc if available and version >= 16, otherwise fall back to clang.
 
+GCC=${GCC:-gcc}
 CLANG=${CLANG:-clang}
-if ! command -v $CLANG > /dev/null; then
-	error_log "Need clang for test $0"
-	test_fail
+
+use_gcc=0
+if command -v $GCC > /dev/null; then
+	gcc_ver=$($GCC -dumpversion 2>/dev/null | cut -d. -f1)
+	if [ "$gcc_ver" -ge 16 ] 2>/dev/null; then
+		use_gcc=1
+	fi
 fi
 
-(cat <<EOF
+src=$(cat <<EOF
 #define __tag(x) __attribute__((btf_decl_tag(#x)))
 
 __tag(a) __tag(b) __tag(c) void foo(void) {}
@@ -31,7 +35,19 @@ __tag(a) __tag(b)          void bar(void) {}
 __tag(a)                   void buz(void) {}
 
 EOF
-) | $CLANG --target=bpf -c -g -x c -o $tmpobj -
+)
+
+if [ "$use_gcc" -eq 1 ]; then
+	info_log "Using $GCC (version $gcc_ver) for btf_decl_tag test"
+	echo "$src" | $GCC -c -g -x c -o $tmpobj - 2>/dev/null
+	pahole -J $tmpobj 2>/dev/null
+elif command -v $CLANG > /dev/null; then
+	info_log "Using $CLANG for btf_decl_tag test"
+	echo "$src" | $CLANG --target=bpf -c -g -x c -o $tmpobj -
+else
+	error_log "Need gcc >= 16 or clang for test $0"
+	test_fail
+fi
 
 # tags order is not guaranteed
 sort_tags=$(cat <<EOF

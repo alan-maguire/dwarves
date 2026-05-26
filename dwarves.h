@@ -666,7 +666,8 @@ static inline int tag__is_tag_type(const struct tag *tag)
 	       tag->tag == DW_TAG_volatile_type ||
 	       tag->tag == DW_TAG_atomic_type ||
 	       tag->tag == DW_TAG_unspecified_type ||
-	       tag->tag == DW_TAG_LLVM_annotation;
+	       tag->tag == DW_TAG_LLVM_annotation ||
+	       tag->tag == DW_TAG_GNU_annotation;
 }
 
 static inline const char *tag__decl_file(const struct tag *tag,
