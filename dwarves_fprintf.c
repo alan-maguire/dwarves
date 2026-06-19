@@ -963,6 +963,7 @@ out_type_not_found:
 static size_t class__fprintf_cacheline_boundary(struct conf_fprintf *conf,
 						uint32_t offset,
 						FILE *fp);
+static size_t tag__attributes_fprintf(const struct tag *tag, FILE *fp);
 
 static size_t class_member__fprintf(struct class_member *member, bool union_member,
 				     struct tag *type, const struct cu *cu,
@@ -995,6 +996,8 @@ static size_t class_member__fprintf(struct class_member *member, bool union_memb
 
 	if (member->is_static)
 		printed += fprintf(fp, "static ");
+
+	printed += tag__attributes_fprintf(&member->tag, fp);
 
 	/* For struct-like constructs, the name of the member cannot be
 	 * conflated with the name of its type, otherwise __attribute__ are

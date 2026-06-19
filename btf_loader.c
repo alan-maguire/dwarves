@@ -506,10 +506,24 @@ static struct tag *function__parameter(const struct function *func, struct cu *c
 	return ftype__parameter(tag__ftype(tag), component_idx);
 }
 
+static struct tag *type__member(struct type *type, int component_idx)
+{
+	struct class_member *member;
+	int idx = 0;
+
+	type__for_each_data_member(type, member) {
+		if (idx == component_idx)
+			return &member->tag;
+		++idx;
+	}
+
+	return NULL;
+}
+
 static int process_decl_tag(struct cu *cu, const struct btf_type *tp)
 {
 	int component_idx = btf_decl_tag(tp)->component_idx;
-	struct tag *tag = cu__type(cu, tp->type);
+	struct tag *tag;
 	struct attributes *tmp;
 
 	tag = cu__function(cu, tp->type);
@@ -522,7 +536,24 @@ static int process_decl_tag(struct cu *cu, const struct btf_type *tp)
 		}
 	}
 
-	if (tag == NULL)
+	if (tag == NULL) {
+		tag = cu__type(cu, tp->type);
+
+		if (component_idx >= 0 && tag != NULL) {
+			if (tag != NULL && (tag__is_struct(tag) || tag__is_union(tag))) {
+				tag = type__member(tag__type(tag), component_idx);
+				if (tag == NULL) {
+					fprintf(stderr, "WARNING: BTF_KIND_DECL_TAG for unknown member %d in BTF id %d\n",
+						component_idx, tp->type);
+					return 0;
+				}
+			} else {
+				tag = NULL;
+			}
+		}
+	}
+
+	if (tag == NULL && component_idx < 0)
 		tag = cu__tag(cu, tp->type);
 
 	if (tag == NULL) {
