@@ -43,6 +43,12 @@ __tag(a) __tag(b)          void bar(void) {}
 __tag(a)                   void buz(void) {}
 void qux(int __tag(param_a) arg) {}
 
+struct tagged {
+	int __tag(member_tag) member;
+};
+
+struct tagged tagged_global;
+
 EOF
 )
 
@@ -72,18 +78,18 @@ void qux(param_a int arg);
 EOF
 )
 
+expected_member="member_tag int member;"
+
 run_test() {
 	local compiler=$1
 	local tmpobj=$2
+	local member_out
 
 	info_log "Testing with $compiler"
 	out=$(pfunct -P -F btf $tmpobj | awk "$sort_tags" | sort)
 	d=$(diff -u <(echo "$expected") <(echo "$out"))
 
-	if [[ "$d" == "" ]]; then
-		info_log "  passed"
-		return 0
-	else
+	if [[ "$d" != "" ]]; then
 		error_log "pfunct output does not match expected ($compiler):"
 		info_log "$d"
 		info_log
@@ -91,6 +97,23 @@ run_test() {
 		info_log "$out"
 		return 1
 	fi
+
+	member_out=$(pahole -F btf $tmpobj | awk '
+		/member_tag/ {
+			sub(/;.*/, ";");
+			gsub(/[[:space:]]+/, " ");
+			sub(/^ /, "");
+			print;
+		}')
+	if [[ "$member_out" != "$expected_member" ]]; then
+		error_log "pahole member decl tag output does not match expected ($compiler):"
+		info_log "expected: $expected_member"
+		info_log "got:      $member_out"
+		return 1
+	fi
+
+	info_log "  passed"
+	return 0
 }
 
 failed=0
