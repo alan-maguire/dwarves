@@ -1312,9 +1312,9 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 		name = parameter__name(param);
 		if (!name) {
 			name = "";
-		} else if (param->true_sig_member_name) {
-			/* Non-null param->true_sig_member_name indicates that the parameter
-			 * name is <parameter_name>__<field_name>.
+		} else if (param->true_sig_member_applied) {
+			/* A true-signature member rewrite names the parameter as
+			 * <parameter_name>__<field_name>.
 			 */
 			if (asprintf(&final_name, "%s__%s", name, param->true_sig_member_name) == -1) {
 				err = -ENOMEM;

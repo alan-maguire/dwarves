@@ -3101,6 +3101,7 @@ static bool parameter__apply_true_sig_member(struct parameter *parm, struct cu *
 		return false;
 
 	parm->tag.type = dtype->small_id;
+	parm->true_sig_member_applied = 1;
 	return true;
 }
 
