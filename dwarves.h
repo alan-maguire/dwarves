@@ -830,6 +830,8 @@ struct inline_expansion {
 	struct ip_tag	 ip;
 	size_t		 size;
 	uint64_t	 high_pc;
+	struct list_head parms;
+	uint16_t	 nr_parms;
 };
 
 static inline struct inline_expansion *
@@ -837,6 +839,10 @@ static inline struct inline_expansion *
 {
 	return (struct inline_expansion *)tag;
 }
+
+struct parameter;
+void inline_expansion__add_parameter(struct inline_expansion *exp,
+				     struct parameter *parm);
 
 struct label {
 	struct ip_tag	 ip;
