@@ -1183,16 +1183,19 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
  * floats, etc.  This ensures backwards compatibility.
  */
 #define BTF_DEFAULT_FEATURE(name, alias, initial_value)		\
-	{ #name, #alias, &conf_load.alias, initial_value, true, NULL }
+	{ #name, #alias, &conf_load.alias, initial_value, true, NULL, NULL }
 
 #define BTF_DEFAULT_FEATURE_CHECK(name, alias, initial_value, feature_check)	\
-	{ #name, #alias, &conf_load.alias, initial_value, true, feature_check }
+	{ #name, #alias, &conf_load.alias, initial_value, true, feature_check, NULL }
 
 #define BTF_NON_DEFAULT_FEATURE(name, alias, initial_value)	\
-	{ #name, #alias, &conf_load.alias, initial_value, false, NULL }
+	{ #name, #alias, &conf_load.alias, initial_value, false, NULL, NULL }
 
 #define BTF_NON_DEFAULT_FEATURE_CHECK(name, alias, initial_value, feature_check) \
-	{ #name, #alias, &conf_load.alias, initial_value, false, feature_check }
+	{ #name, #alias, &conf_load.alias, initial_value, false, feature_check, NULL }
+
+#define BTF_NON_DEFAULT_FEATURE_CHECK_SEC(name, alias, initial_value, feature_check) \
+	{ #name, #alias, &conf_load.alias, initial_value, false, feature_check, &conf_load.alias##_sec_suffix }
 
 static bool enum64_check(void)
 {
@@ -1214,6 +1217,11 @@ static bool layout_check(void)
 	return btf__new_empty_opts != NULL;
 }
 
+static bool location_check(void)
+{
+	return btf__add_loc_param != NULL;
+}
+
 struct btf_feature {
 	const char      *name;
 	const char      *option_alias;
@@ -1223,6 +1231,7 @@ struct btf_feature {
 						 * be enabled for --btf_features=default
 						 */
 	bool		(*feature_check)(void);
+	char		**conf_value_sec_suffix;
 } btf_features[] = {
 	BTF_DEFAULT_FEATURE(encode_force, btf_encode_force, false),
 	BTF_DEFAULT_FEATURE(var, skip_encoding_btf_vars, true),
@@ -1240,7 +1249,8 @@ struct btf_feature {
 	BTF_NON_DEFAULT_FEATURE_CHECK(attributes, btf_attributes, false,
 				      attributes_check),
 	BTF_NON_DEFAULT_FEATURE(true_signature, true_signature, false),
-	BTF_NON_DEFAULT_FEATURE_CHECK(layout, btf_gen_layout, false, layout_check)
+	BTF_NON_DEFAULT_FEATURE_CHECK(layout, btf_gen_layout, false, layout_check),
+	BTF_NON_DEFAULT_FEATURE_CHECK_SEC(inline, btf_gen_inlines, false, location_check)
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -1265,11 +1275,30 @@ static void init_btf_features(void)
 
 static struct btf_feature *find_btf_feature(char *name)
 {
+	char *sec_suffix = strchr(name, '.');
+	size_t cmp_len = sec_suffix ? (size_t)(sec_suffix - name) : strlen(name);
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
-		if (strcmp(name, btf_features[i].name) == 0)
-			return &btf_features[i];
+		struct btf_feature *feature = &btf_features[i];
+
+		if (strlen(feature->name) != cmp_len ||
+		    strncmp(name, feature->name, cmp_len) != 0)
+			continue;
+		if (sec_suffix && !feature->conf_value_sec_suffix)
+			return NULL;
+		if (sec_suffix) {
+			char *suffix = strdup(sec_suffix);
+
+			if (!suffix) {
+				fprintf(stderr, "Failed to allocate BTF feature suffix '%s'\n",
+					sec_suffix);
+				exit(EXIT_FAILURE);
+			}
+			free(*feature->conf_value_sec_suffix);
+			*feature->conf_value_sec_suffix = suffix;
+		}
+		return feature;
 	}
 	return NULL;
 }
