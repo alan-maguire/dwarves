@@ -1520,14 +1520,6 @@ static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *
 	parameter__finish_piece_decode(parm, die, conf, cu);
 }
 
-static bool ftype__analyze_locations(const struct ftype *ftype, const struct cu *cu,
-				     const struct conf_load *conf)
-{
-	bool true_sig_enabled = conf->true_signature && ftype->signature_changed;
-
-	return !cu->producer_clang || true_sig_enabled;
-}
-
 static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf,
 					struct ftype *ftype, int param_idx)
 {
@@ -1539,13 +1531,10 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct co
 		tag__init(&parm->tag, cu, die);
 		parm->name = attr_string(die, DW_AT_name, conf);
 		parm->idx = param_idx;
+		parm->loc_reg = PARAMETER_UNKNOWN_REG;
 		if (!ftype)
 			return parm;
 
-		if (!ftype__analyze_locations(ftype, cu, conf))
-			return parm;
-
-		parm->loc_reg = PARAMETER_UNKNOWN_REG;
 		parm->type_byte_size = get_type_byte_size(die, cu);
 		parm->passed_in_memory = parm->type_byte_size >
 			(cu->agg_use_two_regs ? 2 * cu->addr_size : cu->addr_size);
@@ -3120,9 +3109,10 @@ static void function__analyze_parameter_locations(struct function *fn, struct cu
 	struct ftype *ftype = &fn->proto;
 	struct parameter *pos;
 	bool true_sig_enabled = conf->true_signature && ftype->signature_changed;
+	bool check_locations = !cu->producer_clang || ftype->signature_changed;
 	int reg_idx = 0;
 
-	if (!ftype__analyze_locations(ftype, cu, conf))
+	if (!check_locations)
 		return;
 
 	ftype__for_each_parameter(ftype, pos) {

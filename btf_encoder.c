@@ -1312,7 +1312,9 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 		name = parameter__name(param);
 		if (!name) {
 			name = "";
-		} else if (param->true_sig_member_name) {
+		} else if (encoder->true_signature &&
+			   ftype->signature_changed &&
+			   param->true_sig_member_name) {
 			/* Non-null param->true_sig_member_name indicates that the parameter
 			 * name is <parameter_name>__<field_name>.
 			 */
