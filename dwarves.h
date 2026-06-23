@@ -488,6 +488,19 @@ bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool ver
 			continue;			\
 		else
 
+/**
+ * cu__for_each_inline_expansion - iterate thru all inline expansions
+ * @cu: struct cu instance to iterate
+ * @id: uint32_t tag id
+ * @pos: struct inline_expansion iterator
+ */
+#define cu__for_each_inline_expansion(cu, id, pos)	\
+	for (id = 0; id < cu->tags_table.nr_entries; ++id) \
+		if (!tag__is_inline_expansion(cu->tags_table.entries[id]) || \
+		    !(pos = tag__inline_expansion(cu->tags_table.entries[id]))) \
+			continue;			\
+		else
+
 int cu__add_tag(struct cu *cu, struct tag *tag, uint32_t *id);
 int cu__add_tag_with_id(struct cu *cu, struct tag *tag, uint32_t id);
 int cu__table_add_tag(struct cu *cu, struct tag *tag, uint32_t *id);
@@ -605,6 +618,11 @@ static inline bool tag__is_variable(const struct tag *tag)
 static inline bool tag__is_constant(const struct tag *tag)
 {
 	return tag->tag == DW_TAG_constant;
+}
+
+static inline bool tag__is_inline_expansion(const struct tag *tag)
+{
+	return tag && tag->tag == DW_TAG_inlined_subroutine;
 }
 
 static inline bool tag__is_volatile(const struct tag *tag)
@@ -826,12 +844,16 @@ struct ip_tag {
 	uint64_t   addr;
 };
 
+struct function;
+struct parameter;
+
 struct inline_expansion {
 	struct ip_tag	 ip;
 	const char	 *name;
 	size_t		 size;
 	uint64_t	 high_pc;
 	struct list_head parms;
+	struct function	 *function;
 	uint16_t	 nr_parms;
 };
 
@@ -841,9 +863,16 @@ static inline struct inline_expansion *
 	return (struct inline_expansion *)tag;
 }
 
-struct parameter;
 void inline_expansion__add_parameter(struct inline_expansion *exp,
 				     struct parameter *parm);
+
+/**
+ * inline_expansion__for_each_parameter - iterate thru all the parameters
+ * @ie: struct inline_expansion instance to iterate
+ * @pos: struct parameter iterator
+ */
+#define inline_expansion__for_each_parameter(ie, pos) \
+	list_for_each_entry(pos, &(ie)->parms, tag.node)
 
 struct label {
 	struct ip_tag	 ip;
@@ -960,11 +989,17 @@ struct parameter {
 	unsigned long first_reg_fields;
 	unsigned long second_reg_fields;
 	int loc_reg;
+	int32_t loc_offset;
+	uint64_t loc_value;
 	uint16_t type_byte_size;
+	uint8_t loc_size;
 	uint8_t true_sig_type_from_types:1;
 	uint8_t has_const_value:1;
 	uint8_t loc_const_value:1;
 	uint8_t loc_stack:1;
+	uint8_t loc_deref:1;
+	uint8_t loc_addr:1;
+	uint8_t loc_signed:1;
 	uint8_t optimized:1;
 	uint8_t unexpected_reg:1;
 	uint8_t has_loc:1;
