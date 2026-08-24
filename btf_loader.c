@@ -30,6 +30,12 @@
 #include "dutil.h"
 #include "dwarves.h"
 
+struct btf_locsec_entry {
+	uint32_t func;
+	uint32_t loc_proto;
+	uint32_t offset;
+};
+
 static const char *cu__btf_str(struct cu *cu, uint32_t offset)
 {
 	return offset ? btf__str_by_offset(cu->priv, offset) : NULL;
@@ -670,9 +676,53 @@ static int btf__load_types(struct btf *btf, struct cu *cu)
 	return 0;
 }
 
+static bool btf__has_location_support(void)
+{
+	return btf__add_loc_param && btf__add_loc_param_value &&
+		btf__add_loc_proto && btf__add_loc_proto_param &&
+		btf__add_locsec && btf__add_locsec_loc;
+}
+
+static void btf__mark_inline_functions(struct btf *btf, struct cu *cu)
+{
+	const struct btf_type *type_ptr;
+	uint32_t type_index, type;
+
+	if (!btf__has_location_support())
+		return;
+
+	for (type_index = 1; type_index < btf__type_cnt(btf); type_index++) {
+		const struct btf_locsec_entry *entries;
+		const char *name;
+		uint16_t i;
+
+		type_ptr = btf__type_by_id(btf, type_index);
+		type = btf_kind(type_ptr);
+		if (type != BTF_KIND_LOCSEC)
+			continue;
+
+		name = cu__btf_str(cu, type_ptr->name_off);
+		if (!name || strcmp(name, "inline") != 0)
+			continue;
+
+		entries = (const struct btf_locsec_entry *)(type_ptr + 1);
+		for (i = 0; i < btf_vlen(type_ptr); i++) {
+			struct tag *tag = cu__function(cu, entries[i].func);
+
+			if (tag)
+				tag__function(tag)->inlined = DW_INL_declared_inlined;
+		}
+	}
+}
+
 static int btf__load_sections(struct btf *btf, struct cu *cu)
 {
-	return btf__load_types(btf, cu);
+	int err = btf__load_types(btf, cu);
+
+	if (!err)
+		btf__mark_inline_functions(btf, cu);
+
+	return err;
 }
 
 static uint32_t class__infer_alignment(const struct conf_load *conf,
