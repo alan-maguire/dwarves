@@ -1215,6 +1215,13 @@ static bool layout_check(void)
 	return btf__new_empty_opts != NULL;
 }
 
+static bool location_check(void)
+{
+	return btf__add_loc_param && btf__add_loc_param_value &&
+		btf__add_loc_proto && btf__add_loc_proto_param &&
+		btf__add_locsec && btf__add_locsec_loc;
+}
+
 struct btf_feature {
 	const char      *name;
 	const char      *option_alias;
@@ -1241,7 +1248,8 @@ struct btf_feature {
 	BTF_NON_DEFAULT_FEATURE_CHECK(attributes, btf_attributes, false,
 				      attributes_check),
 	BTF_NON_DEFAULT_FEATURE(true_signature, true_signature, false),
-	BTF_NON_DEFAULT_FEATURE_CHECK(layout, btf_gen_layout, false, layout_check)
+	BTF_NON_DEFAULT_FEATURE_CHECK(layout, btf_gen_layout, false, layout_check),
+	BTF_NON_DEFAULT_FEATURE_CHECK(inline, btf_gen_inlines, false, location_check)
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -3720,6 +3728,10 @@ try_sole_arg_as_class_names:
 		}
 	}
 
+	if (conf_load.btf_gen_inlines) {
+		/* BTF encoding normally omits inline DIEs; inline BTF needs them. */
+		conf_load.ignore_inline_expansions = false;
+	}
 	err = cus__load_files(cus, &conf_load, argv + remaining);
 	if (err != 0) {
 		if (class_name == NULL && !btf_encode && !ctf_encode) {
