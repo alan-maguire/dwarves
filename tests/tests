@@ -1,30 +1,607 @@
-#/bin/sh
+#!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright © 2024 Red Hat Inc, Arnaldo Carvalho de Melo <acme@redhat.com>
+#
+# Run all test scripts in parallel, printing results in order as tests
+# complete — modeled after 'perf test' output format. Each test gets a
+# single status line; failures show detail below. A final summary lists
+# any failed tests so the user doesn't have to scroll up.
 
-tests_dir=$(dirname $0)
-cd $tests_dir
+usage() {
+	cat <<EOF
+Usage: $0 [OPTIONS] [TEST_NUMBERS...]
 
-let status=0
-let nr=1
-for test in *.sh ; do
-	if [ $test != "test_lib.sh" ]; then
-		printf "%d: $test\n" $nr
-		./$test $1
-		case $? in
-		0)
+Options:
+  --vmlinux PATH       Use specified vmlinux file for tests requiring it
+  --jobs N, -j N       Run at most N tests in parallel (default: unlimited)
+  --verbose, -v        Show verbose test output on failure (more diagnostic info)
+  --dump-artifacts     Dump DWARF/BTF info from binary artifacts on failure
+  --help, -h           Show this help message
+  TEST_NUMBERS         Optional space-separated test numbers to run (e.g., 16 23 57)
+
+Environment variables:
+  VMLINUX              Path to vmlinux file (alternative to --vmlinux)
+  VERBOSE              Enable verbose test output (alternative to --verbose)
+  DUMP_ARTIFACTS       Enable artifact dumping (alternative to --dump-artifacts)
+  ARTIFACT_SIZE_LIMIT  Max size in KB for dumping artifacts (default: 100)
+  ARTIFACT_FILE_LIMIT  Max number of artifacts to dump per test (default: 5)
+  PERF_BIN             Path to pre-built perf binary with debug info
+  PERF_SRC_DIR         Path to kernel source tree for building perf with debug info
+                       (avoids downloading from kernel.org mirrors)
+  PERF_CACHE_DIR       Override perf build cache location
+
+Test artifacts and cleanup:
+  All test artifacts are stored under /tmp/pahole-tests/ for easy management.
+  On systems with limited tmpfs space, parallel test execution can accumulate
+  significant space usage (multiple tests compiling .o files simultaneously).
+  Failed test directories are preserved for debugging.
+  To reclaim space: rm -rf /tmp/pahole-tests
+
+Examples:
+  $0                                    # Run all tests in parallel
+  $0 -j 4                               # Run at most 4 tests at once (low-memory systems)
+  $0 -j 1                               # Run tests serially (very low memory)
+  $0 16 23 57                           # Run only tests 16, 23, and 57
+  $0 -v 48                              # Run test 48 with verbose output on failure
+  $0 -v --dump-artifacts 48             # Verbose + dump .o/.so files from test 48
+  $0 --vmlinux /boot/vmlinux-6.11.0     # Run all with specific vmlinux
+  VMLINUX=/boot/vmlinux-6.11.0 $0 16    # Run test 16 with vmlinux
+  PERF_BIN=/tmp/build/perf/perf $0      # Use pre-built perf binary
+  PERF_SRC_DIR=/usr/src/linux $0        # Build perf from local kernel source
+  ARTIFACT_SIZE_LIMIT=500 $0 -v --dump-artifacts  # Dump artifacts up to 500KB
+EOF
+	exit 0
+}
+
+# Parse command line arguments
+requested_tests=""
+max_jobs=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--vmlinux)
+			shift
+			if [ -z "$1" ]; then
+				echo "Error: --vmlinux requires a file path" >&2
+				exit 1
+			fi
+			export VMLINUX="$1"
+			shift
 			;;
-		2)
+		--jobs|-j)
+			shift
+			if [ -z "$1" ] || ! echo "$1" | grep -qE '^[0-9]+$'; then
+				echo "Error: --jobs requires a positive number" >&2
+				exit 1
+			fi
+			max_jobs="$1"
+			shift
+			;;
+		--verbose|-v)
+			export VERBOSE=1
+			shift
+			;;
+		--dump-artifacts)
+			export DUMP_ARTIFACTS=1
+			shift
+			;;
+		--help|-h)
+			usage
+			;;
+		[0-9]*)
+			# Test number argument
+			requested_tests="$requested_tests $1"
+			shift
 			;;
 		*)
-			status=1
+			echo "Error: unknown option '$1'" >&2
+			echo "Use --help for usage information" >&2
+			exit 1
 			;;
-		esac
-		let nr+=1
-		echo "---"
-	fi
+	esac
 done
 
-cd -
+tests_dir=$(dirname "$0")
+cd "$tests_dir"
 
+# Create master test directory for all test artifacts
+# All test artifacts (both coordination files and individual test tmpdirs)
+# go under /tmp/pahole-tests/ for easy cleanup and space management
+test_master_dir="/tmp/pahole-tests"
+mkdir -p "$test_master_dir" || exit 1
+
+# Show version of tools being tested (for debugging test output)
+# NOTE: tests/tests expects the build directory to be at the front of PATH
+# See AGENTS.md for requirements when calling tests/tests
+echo "Testing pahole version:"
+if command -v pahole >/dev/null 2>&1; then
+	pahole --devel_version 2>&1 | sed 's/^/  /'
+else
+	echo "  ERROR: pahole not found in PATH"
+	echo "  Ensure the build directory is at the front of PATH before running tests"
+	echo "  Example: export PATH=\$(pwd)/build:\$PATH"
+	exit 1
+fi
+echo ""
+
+# Show diagnostic environment info when verbose mode is enabled
+if [ "${VERBOSE:-0}" = "1" ]; then
+	echo "Verbose mode enabled - showing diagnostic information:"
+
+	# System information
+	echo "  Architecture: $(uname -m)"
+	if [ -r /proc/cpuinfo ]; then
+		ncpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "unknown")
+		echo "  CPUs: $ncpus"
+	else
+		echo "  CPUs: unknown"
+	fi
+	if [ -r /proc/meminfo ]; then
+		mem_total=$(awk '/^MemTotal:/ {printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")
+		swap_total=$(awk '/^SwapTotal:/ {printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo "unknown")
+		echo "  Memory: ${mem_total} GB"
+		echo "  Swap: ${swap_total} GB"
+	else
+		echo "  Memory: unknown"
+		echo "  Swap: unknown"
+	fi
+
+	# Test parallelism settings
+	if [ -n "$max_jobs" ]; then
+		echo "  Parallelism: -j ${max_jobs} (max ${max_jobs} tests in parallel)"
+	else
+		echo "  Parallelism: unlimited (all tests run in parallel)"
+		echo "    Tip: On low-memory systems, use -j to limit parallelism (e.g., -j 4 or -j 1)"
+	fi
+
+	# Test artifact location and cleanup
+	echo "  Test artifacts: $test_master_dir/"
+	if [ -d "$test_master_dir" ]; then
+		artifact_count=$(find "$test_master_dir" -maxdepth 1 -type d 2>/dev/null | wc -l)
+		artifact_count=$((artifact_count - 1))  # Subtract the master dir itself
+		if [ "$artifact_count" -gt 0 ]; then
+			artifact_size=$(du -sh "$test_master_dir" 2>/dev/null | awk '{print $1}')
+			echo "    Warning: ${artifact_count} leftover test directories (${artifact_size})"
+			echo "    Parallel tests can accumulate tmpfs space during execution"
+			echo "    Clean up with: rm -rf $test_master_dir"
+		fi
+	fi
+
+	# Software versions
+	echo "  Compiler: $(${CC:-gcc} --version 2>/dev/null | head -1 || echo 'not found')"
+	echo "  libc: $(ldd --version 2>&1 | head -1 || echo 'unknown')"
+	if command -v bpftool >/dev/null 2>&1; then
+		echo "  bpftool: $(bpftool version 2>&1 | head -1 || echo 'available, version unknown')"
+	else
+		echo "  bpftool: not found"
+	fi
+
+	# Environment variables
+	echo "  VMLINUX: ${VMLINUX:-not set}"
+	echo "  PERF_BIN: ${PERF_BIN:-not set}"
+	echo "  PERF_SRC_DIR: ${PERF_SRC_DIR:-not set}"
+	echo ""
+fi
+
+tmpdir=$(mktemp -d "$test_master_dir/pahole-tests.XXXXXX") || exit 1
+
+# High-resolution timestamp for test timing.  GNU date supports %N
+# (nanoseconds), but not all implementations do (busybox, BSD), so fall
+# back to plain seconds when %N is not available.
+now()
+{
+	t=$(date +%s.%N 2>/dev/null)
+	case "$t" in
+		*.[0-9][0-9]*) echo "$t" ;;
+		*) date +%s ;;
+	esac
+}
+
+kill_children() {
+	for pidfile in "$tmpdir"/*.pid; do
+		[ -f "$pidfile" ] || continue
+		p=$(cat "$pidfile")
+		kill "$p" 2>/dev/null
+	done
+}
+
+trap "kill_children; rm -rf $tmpdir" EXIT
+trap "kill_children; rm -rf $tmpdir; exit 1" INT TERM
+
+# Extract the test title from title_log calls in the script
+test_title() {
+	sed -n 's/^title_log *"\(.*\)"/\1/p' "$1" | head -1
+}
+
+# Load previous test times and classify tests as fast or slow
+# Slow tests are launched last so they don't block printing fast results
+test_times_file=".test-times"
+test_times_seed=".test-times.seed"
+fast_tests=""
+slow_tests=""
+
+# On first run, copy seed file to create initial timing data
+if [ ! -f "$test_times_file" ] && [ -f "$test_times_seed" ]; then
+	cp "$test_times_seed" "$test_times_file"
+fi
+
+if [ -f "$test_times_file" ]; then
+	# Calculate average and stddev from previous run
+	total=0
+	count=0
+	times=""
+	while read -r test_name duration; do
+		total=$(awk "BEGIN {print $total + $duration}")
+		count=$((count + 1))
+		times="$times $duration"
+	done < "$test_times_file"
+
+	if [ $count -gt 0 ]; then
+		avg=$(awk "BEGIN {print $total / $count}")
+
+		# Calculate stddev: sqrt(sum((x - avg)^2) / n)
+		sum_sq=0
+		for t in $times; do
+			diff=$(awk "BEGIN {print $t - $avg}")
+			sq=$(awk "BEGIN {print $diff * $diff}")
+			sum_sq=$(awk "BEGIN {print $sum_sq + $sq}")
+		done
+		stddev=$(awk "BEGIN {print sqrt($sum_sq / $count)}")
+
+		# Threshold: avg + 1 * stddev
+		threshold=$(awk "BEGIN {print $avg + $stddev}")
+
+		# Classify each test
+		for test in *.sh; do
+			[ "$test" = "test_lib.sh" ] && continue
+
+			prev_time=$(grep "^$test " "$test_times_file" | awk '{print $2}')
+			if [ -n "$prev_time" ]; then
+				is_slow=$(awk "BEGIN {print ($prev_time > $threshold) ? 1 : 0}")
+				if [ "$is_slow" -eq 1 ]; then
+					slow_tests="$slow_tests $test"
+				else
+					fast_tests="$fast_tests $test"
+				fi
+			else
+				# No timing data, treat as fast
+				fast_tests="$fast_tests $test"
+			fi
+		done
+	fi
+fi
+
+# If no timing data or classification failed, all tests are fast
+if [ -z "$fast_tests" ] && [ -z "$slow_tests" ]; then
+	for test in *.sh; do
+		[ "$test" = "test_lib.sh" ] && continue
+		fast_tests="$fast_tests $test"
+	done
+fi
+
+# Launch fast tests first (alphabetically), then slow tests
+# This ensures slow tests don't block printing of fast test results
+all_tests="$fast_tests $slow_tests"
+
+# Build test number mapping for all tests
+nr=1
+for test in $all_tests; do
+	echo "$test $nr" >> "$tmpdir/all-test-numbers.txt"
+	nr=$((nr + 1))
+done
+
+# Filter tests if specific numbers were requested
+if [ -n "$requested_tests" ]; then
+	launch_list=""
+	for num in $requested_tests; do
+		test=$(awk -v n="$num" '$2 == n {print $1}' "$tmpdir/all-test-numbers.txt")
+		if [ -z "$test" ]; then
+			echo "Error: test number $num not found (valid range: 1-$((nr-1)))" >&2
+			exit 1
+		fi
+		launch_list="$launch_list $test"
+	done
+else
+	launch_list="$all_tests"
+fi
+
+# Launch selected tests
+# If --jobs is specified, limit concurrent execution to avoid OOM on low-memory systems
+num_tests=0
+for test in $launch_list; do
+	# Wait for a test slot if we're at the concurrency limit
+	if [ -n "$max_jobs" ] && [ "$max_jobs" -gt 0 ]; then
+		while true; do
+			# Count running test processes
+			running=0
+			for pidfile in "$tmpdir"/*.pid; do
+				[ -f "$pidfile" ] || continue
+				pid=$(cat "$pidfile" 2>/dev/null)
+				if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+					running=$((running + 1))
+				fi
+			done
+
+			# Launch if under limit
+			if [ $running -lt "$max_jobs" ]; then
+				break
+			fi
+
+			# Wait a bit before rechecking
+			sleep 0.1
+		done
+	fi
+
+	start_time=$(now)
+
+	# Set memory limit for test if on low-memory system
+	# On systems with <4GB RAM, limit each test to 1.5GB to prevent OOM
+	avail_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo "0")
+	avail_gb=$((avail_kb / 1024 / 1024))
+	if [ "$avail_gb" -lt 4 ]; then
+		# Low memory system: limit each test to 1.5GB virtual memory
+		(ulimit -v 1572864; ./"$test") > "$tmpdir/$test.out" 2>&1 &
+	else
+		./"$test" > "$tmpdir/$test.out" 2>&1 &
+	fi
+
+	pid=$!
+	echo $pid > "$tmpdir/$test.pid"
+	echo "$test $start_time" >> "$tmpdir/launch-times.txt"
+	num_tests=$((num_tests + 1))
+done
+
+WIDTH=72
+status=0
+nr=1
+failed_list=""
+nr_failed=0
+
+# Helper function to print test result
+print_test_result() {
+	test=$1
+	nr=$2
+
+	pid=$(cat "$tmpdir/$test.pid")
+	title=$(test_title "$test")
+	[ -z "$title" ] && title="${test%.sh}"
+	label=$(printf "%3d: %-$((WIDTH - 5)).$((WIDTH - 5))s" "$nr" "$title")
+
+	# Print label immediately, result appended when done
+	printf "%s" "$label"
+	wait "$pid"
+	rc=$?
+	end_time=$(now)
+
+	# Get start time from launch record
+	start_time=$(grep "^$test " "$tmpdir/launch-times.txt" | awk '{print $2}')
+	duration=$(awk "BEGIN {printf \"%.2f\", $end_time - $start_time}")
+
+	# Save timing for next run
+	echo "$test $duration" >> "$tmpdir/test-times.txt"
+
+	case $rc in
+	0)
+		printf ": Ok\n"
+		;;
+	2)
+		reason=$(grep -i 'skip:' "$tmpdir/$test.out" | head -1 | sed 's/.*skip: *//')
+		if [ -n "$reason" ]; then
+			printf ": Skip (%s)\n" "$reason"
+		else
+			printf ": Skip\n"
+		fi
+		;;
+	*)
+		printf ": FAILED!\n"
+		if [ "${VERBOSE:-0}" = "1" ]; then
+			# Verbose mode: show full test output for complete diagnosis
+			# This includes all commands run, their outputs, and test artifacts
+			echo "     --- Full test output ---"
+			sed 's/^/     /' "$tmpdir/$test.out"
+			echo "     --- End of output ---"
+
+			# Also show contents of any referenced log files
+			# Extract file paths that look like logs (end in .log or are in /tmp)
+			# This is critical for container runs where files vanish after exit
+			log_files=$(grep -oE '(/tmp/[^ ]+\.log|[^ ]+/build\.log|[^ ]+/[^ ]+\.log)' "$tmpdir/$test.out" 2>/dev/null | sort -u)
+			if [ -n "$log_files" ]; then
+				for logfile in $log_files; do
+					if [ -f "$logfile" ]; then
+						echo "     --- Contents of $logfile ---"
+						sed 's/^/     /' "$logfile"
+						echo "     --- End of $logfile ---"
+					fi
+				done
+			fi
+
+			# If --dump-artifacts is set, dump DWARF/BTF info from binary files
+			# This is critical for debugging in containers where .o/.so files vanish
+			if [ "${DUMP_ARTIFACTS:-0}" = "1" ]; then
+				# Extract test temp directory from output (e.g., /tmp/test_name.XXXXXX)
+				test_tmpdir=$(grep -oE '/tmp/[^ ]+\.[A-Za-z0-9]{6,}' "$tmpdir/$test.out" 2>/dev/null | head -1)
+				if [ -n "$test_tmpdir" ] && [ -d "$test_tmpdir" ]; then
+					size_limit_kb=${ARTIFACT_SIZE_LIMIT:-100}
+					file_limit=${ARTIFACT_FILE_LIMIT:-5}
+					size_limit=$((size_limit_kb * 1024))
+
+					# Find binary artifacts (.o, .so files)
+					bin_files=$(find "$test_tmpdir" -type f \( -name "*.o" -o -name "*.so" \) 2>/dev/null | head -$file_limit)
+
+					if [ -n "$bin_files" ]; then
+						echo "     --- Binary artifacts analysis (limit: ${size_limit_kb}KB, ${file_limit} files) ---"
+						count=0
+						for binfile in $bin_files; do
+							count=$((count + 1))
+							if [ ! -f "$binfile" ]; then
+								continue
+							fi
+
+							# Get file size (portable: try stat -c first, fall back to stat -f)
+							size=$(stat -c%s "$binfile" 2>/dev/null || stat -f%z "$binfile" 2>/dev/null || echo "0")
+							size_kb=$((size / 1024))
+
+							if [ "$size" -gt "$size_limit" ]; then
+								echo "     --- Skipping $binfile (${size_kb}KB > ${size_limit_kb}KB limit) ---"
+								continue
+							fi
+
+							echo "     --- Binary artifact: $binfile (${size_kb}KB) ---"
+
+							# Show ELF sections (abbreviated)
+							if command -v readelf >/dev/null 2>&1; then
+								echo "     === ELF sections ==="
+								readelf -S "$binfile" 2>&1 | sed 's/^/     /' | head -25
+
+								echo "     === Symbol table (first 30 entries) ==="
+								readelf -s "$binfile" 2>&1 | sed 's/^/     /' | head -30
+
+								# Show DWARF variable info if present
+								if readelf -S "$binfile" 2>/dev/null | grep -q '\.debug_info'; then
+									echo "     === DWARF variables (abbreviated) ==="
+									readelf -wi "$binfile" 2>&1 | grep -A6 "DW_TAG_variable" | sed 's/^/     /' | head -60
+								fi
+							fi
+
+							# If BTF section exists, dump it with bpftool
+							if readelf -S "$binfile" 2>/dev/null | grep -q '\.BTF' && command -v bpftool >/dev/null 2>&1; then
+								echo "     === BTF dump ==="
+								bpftool btf dump file "$binfile" 2>&1 | sed 's/^/     /' | head -50
+							fi
+
+							echo "     --- End of $binfile ---"
+						done
+						echo "     --- End of binary artifacts (analyzed $count files) ---"
+					fi
+				fi
+			fi
+		else
+			# Normal mode: show first 5 error lines
+			grep -E 'FAIL|ERROR|error' "$tmpdir/$test.out" | head -5 | sed 's/^/     /'
+		fi
+		status=1
+		nr_failed=$((nr_failed + 1))
+		failed_list="$failed_list
+  $nr: $title"
+		;;
+	esac
+}
+
+# Assign test numbers to launched tests (use all-test-numbers mapping)
+for test in $launch_list; do
+	test_nr=$(grep "^$test " "$tmpdir/all-test-numbers.txt" | awk '{print $2}')
+	echo "$test $test_nr" >> "$tmpdir/test-numbers.txt"
+done
+
+# Print all tests in completion order (not launch order)
+# This prevents slow tests from blocking display of fast test results
+total_tests=$(echo "$launch_list" | wc -w)
+completed=0
+show_status_line=0
+# Only show status line if more than 5 tests (keeps output clean for quick runs)
+if [ $total_tests -gt 5 ]; then
+	show_status_line=1
+fi
+
+# Track when last result was printed to avoid flicker when tests complete quickly
+last_result_time=$(now)
+status_line_shown=0
+last_status_line=""
+
+while [ $completed -lt $total_tests ]; do
+	# Check which test finished first
+	for test in $launch_list; do
+		# Skip if already printed
+		if [ -f "$tmpdir/$test.printed" ]; then
+			continue
+		fi
+
+		pid=$(cat "$tmpdir/$test.pid" 2>/dev/null) || continue
+		# Non-blocking check if process finished
+		if ! kill -0 "$pid" 2>/dev/null; then
+			# Clear status line before printing result
+			if [ $status_line_shown -eq 1 ]; then
+				printf "\r%-80s\r" ""
+				status_line_shown=0
+				last_status_line=""  # Reset so status line reprints if needed
+			fi
+
+			# Test completed, print it
+			test_nr=$(grep "^$test " "$tmpdir/test-numbers.txt" | awk '{print $2}')
+			print_test_result "$test" "$test_nr"
+			touch "$tmpdir/$test.printed"
+			completed=$((completed + 1))
+			last_result_time=$(now)
+			break
+		fi
+	done
+
+	# Show status line with remaining test numbers (only if >1s since last result)
+	# This avoids flicker when tests complete rapidly
+	if [ $show_status_line -eq 1 ] && [ $completed -lt $total_tests ]; then
+		current_time=$(now)
+		time_since_result=$(awk "BEGIN {printf \"%.2f\", $current_time - $last_result_time}")
+
+		# Only show status if it's been >1 second since last result
+		if awk "BEGIN {exit !($time_since_result > 1.0)}"; then
+			remaining=""
+			first_test=""
+			for test in $launch_list; do
+				if [ ! -f "$tmpdir/$test.printed" ]; then
+					test_nr=$(grep "^$test " "$tmpdir/test-numbers.txt" | awk '{print $2}')
+					remaining="$remaining$test_nr "
+					# Capture first remaining test for description
+					if [ -z "$first_test" ]; then
+						first_test="$test"
+						first_nr="$test_nr"
+					fi
+				fi
+			done
+			remaining_count=$(echo "$remaining" | wc -w)
+
+			# Build status line content
+			new_status_line=""
+			if [ -n "$first_test" ]; then
+				first_title=$(test_title "$first_test")
+				[ -z "$first_title" ] && first_title="${first_test%.sh}"
+				if [ $remaining_count -gt 1 ]; then
+					new_status_line=$(printf "Waiting for: %d (%s) + %d more" "$first_nr" "$first_title" $((remaining_count - 1)))
+				else
+					new_status_line=$(printf "Waiting for: %d (%s)" "$first_nr" "$first_title")
+				fi
+			fi
+
+			# Only print if status line content changed (avoids duplicate lines in saved output)
+			if [ "$new_status_line" != "$last_status_line" ]; then
+				printf "\r%s" "$new_status_line"
+				last_status_line="$new_status_line"
+				status_line_shown=1
+			fi
+		fi
+	fi
+
+	# Small sleep to avoid busy-wait
+	sleep 0.05
+done
+
+# Clear status line after all tests complete
+if [ $status_line_shown -eq 1 ]; then
+	printf "\r%-80s\r" ""
+fi
+
+# Save timing data for next run
+if [ -f "$tmpdir/test-times.txt" ]; then
+	mv "$tmpdir/test-times.txt" "$test_times_file"
+	echo "Saved timing data to $test_times_file ($(wc -l < "$test_times_file") tests)" >&2
+else
+	echo "Warning: No timing data generated ($tmpdir/test-times.txt not found)" >&2
+fi
+
+echo ""
+if [ $nr_failed -gt 0 ]; then
+	echo "Tests that failed ($nr_failed):"
+	echo "$failed_list"
+	echo ""
+fi
+
+cd - > /dev/null
 exit $status

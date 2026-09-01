@@ -46,6 +46,8 @@ enum load_steal_kind {
 	LSK__ABORT,
 };
 
+struct btf_new_opts;
+
 /*
  * Weak declarations of libbpf APIs that are version-dependent
  */
@@ -55,6 +57,7 @@ __weak extern int btf__add_enum64(struct btf *btf, const char *name, __u32 byte_
 __weak extern int btf__add_enum64_value(struct btf *btf, const char *name, __u64 value);
 __weak extern int btf__add_type_attr(struct btf *btf, const char *value, int ref_type_id);
 __weak extern int btf__distill_base(const struct btf *src_btf, struct btf **new_base_btf, struct btf **new_split_btf);
+__weak extern struct btf *btf__new_empty_opts(struct btf_new_opts *opts);
 
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
@@ -95,6 +98,7 @@ struct conf_load {
 	bool			skip_encoding_btf_inconsistent_proto;
 	bool			skip_encoding_btf_vars;
 	bool			encode_btf_global_vars;
+	bool			btf_gen_layout;
 	bool			btf_gen_floats;
 	bool			btf_encode_force;
 	bool			reproducible_build;
@@ -108,6 +112,7 @@ struct conf_load {
 	const char		*kabi_prefix;
 	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
+	bool			force_cu_merging;
 };
 
 /** struct conf_fprintf - hints to the __fprintf routines
@@ -192,17 +197,12 @@ void cus__remove(struct cus *cus, struct cu *cu);
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
 struct cu *cus__find_pair(struct cus *cus, const char *name);
-struct cu *cus__find_cu_by_name(struct cus *cus, const char *name);
 struct tag *cus__find_struct_by_name(struct cus *cus, struct cu **cu,
 				     const char *name, const int include_decls,
 				     type_id_t *id);
-struct tag *cus__find_struct_or_union_by_name(struct cus *cus, struct cu **cu,
-					      const char *name, const int include_decls, type_id_t *id);
 void *cu__tag_alloc(struct cu *cu, size_t size);
 void cu__tag_free(struct cu *cu, struct tag *tag);
 struct tag *cu__find_type_by_name(const struct cu *cu, const char *name, const int include_decls, type_id_t *idp);
-struct tag *cus__find_type_by_name(struct cus *cus, struct cu **cu, const char *name,
-				   const int include_decls, type_id_t *id);
 struct function *cus__find_function_at_addr(struct cus *cus, uint64_t addr, struct cu **cu);
 void cus__for_each_cu(struct cus *cus, int (*iterator)(struct cu *cu, void *cookie),
 		      void *cookie,
@@ -302,6 +302,8 @@ struct cu {
 	uint8_t		 has_addr_info:1;
 	uint8_t		 uses_global_strings:1;
 	uint8_t		 little_endian:1;
+	uint8_t		 producer_clang:1;
+	uint8_t		 agg_use_two_regs:1;	/* An aggregate like {long a; long b;} */
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
@@ -504,8 +506,6 @@ struct tag *cu__tag(const struct cu *cu, const uint32_t id);
 struct tag *cu__type(const struct cu *cu, const type_id_t id);
 struct tag *cu__find_struct_by_name(const struct cu *cu, const char *name,
 				    const int include_decls, type_id_t *id);
-struct tag *cu__find_struct_or_union_by_name(const struct cu *cu, const char *name,
-					     const int include_decls, type_id_t *id);
 bool cu__same_build_id(const struct cu *cu, const struct cu *other);
 void cu__account_inline_expansions(struct cu *cu);
 int cu__for_all_tags(struct cu *cu,
@@ -666,7 +666,7 @@ static inline int tag__is_tag_type(const struct tag *tag)
 	       tag->tag == DW_TAG_volatile_type ||
 	       tag->tag == DW_TAG_atomic_type ||
 	       tag->tag == DW_TAG_unspecified_type ||
-	       tag->tag == DW_TAG_LLVM_annotation;
+	       tag__is_annotation(tag->tag);
 }
 
 static inline const char *tag__decl_file(const struct tag *tag,
@@ -942,9 +942,21 @@ size_t lexblock__fprintf(const struct lexblock *lexblock, const struct cu *cu,
 struct parameter {
 	struct tag tag;
 	const char *name;
+	const char *true_sig_member_name;
+	Dwarf_Off true_sig_type;
+	unsigned long first_reg_fields;
+	unsigned long second_reg_fields;
+	int loc_reg;
+	uint16_t type_byte_size;
+	uint8_t true_sig_type_from_types:1;
+	uint8_t true_sig_type_from_alt:1;
+	uint8_t has_const_value:1;
+	uint8_t loc_const_value:1;
+	uint8_t loc_stack:1;
 	uint8_t optimized:1;
 	uint8_t unexpected_reg:1;
 	uint8_t has_loc:1;
+	uint8_t passed_in_memory:1;	/* too large for the ABI argument registers */
 	uint8_t idx;
 };
 
@@ -1011,6 +1023,11 @@ static inline struct formal_parameter_pack *tag__formal_parameter_pack(const str
 
 void formal_parameter_pack__add(struct formal_parameter_pack *pack, struct parameter *param);
 
+struct variant_part {
+	struct tag	 tag;
+	struct list_head variants;
+};
+
 /*
  * tag.tag can be DW_TAG_subprogram_type or DW_TAG_subroutine_type.
  */
@@ -1026,6 +1043,7 @@ struct ftype {
 	uint8_t		 inconsistent_proto:1;
 	uint8_t		 uncertain_parm_loc:1;
 	uint8_t		 reordered_parm:1;
+	uint8_t		 signature_changed:1;
 	struct list_head template_type_params;
 	struct list_head template_value_params;
 	struct template_parameter_pack *template_parameter_pack;
@@ -1281,6 +1299,7 @@ struct type {
 	uint8_t		 is_signed_enum:1;
 	struct list_head template_type_params;
 	struct list_head template_value_params;
+	struct list_head variant_parts;
 	struct template_parameter_pack *template_parameter_pack;
 };
 
@@ -1398,9 +1417,19 @@ static inline struct class_member *class_member__next(struct class_member *membe
 #define type__for_each_tag_safe_reverse(type, pos, n) \
 	list_for_each_entry_safe_reverse(pos, n, &(type)->namespace.tags, tag.node)
 
+/**
+ * type__for_each_variant_part_safe_reverse - safely iterate thru all variant_parts in a type, in reverse order
+ * @type: struct type instance to iterate
+ * @pos: struct variant_part iterator
+ * @n: struct variant_part temp iterator
+ */
+#define type__for_each_variant_part_safe_reverse(type, pos, n) \
+	list_for_each_entry_safe_reverse(pos, n, &(type)->variant_parts, tag.node)
+
 void type__add_member(struct type *type, struct class_member *member);
 void type__add_template_type_param(struct type *type, struct template_type_param *ttparm);
 void type__add_template_value_param(struct type *type, struct template_value_param *tvparam);
+void type__add_variant_part(struct type *type, struct variant_part *vpart);
 
 struct class_member *
 	type__find_first_biggest_size_base_type_member(struct type *type,
@@ -1512,10 +1541,6 @@ static inline int class__is_declaration(const struct class *cls)
 	return cls->type.declaration;
 }
 
-const struct class_member *class__find_bit_hole(const struct class *cls,
-					   const struct class_member *trailer,
-						const uint16_t bit_hole_size);
-
 #define class__for_each_member_from(cls, from, pos)			\
 	pos = list_prepare_entry(from, class__tags(cls), tag.node);	\
 	list_for_each_entry_from(pos, class__tags(cls), tag.node)	\
@@ -1587,8 +1612,6 @@ const char *base_type__name(const struct base_type *btype, char *bf, size_t len)
 
 size_t base_type__name_to_size(struct base_type *btype, struct cu *cu);
 
-bool base_type__language_defined(struct base_type *bt);
-
 struct array_type {
 	struct tag	tag;
 	uint32_t	*nr_entries;
@@ -1625,7 +1648,7 @@ static inline const char *enumerator__name(const struct enumerator *enumerator)
 
 void enumeration__delete(struct type *type, struct cu *cu);
 void enumeration__add(struct type *type, struct enumerator *enumerator);
-size_t enumeration__fprintf(const struct tag *tag_enum,
+size_t enumeration__fprintf(const struct tag *tag_enum, const struct cu *cu,
 			    const struct conf_fprintf *conf, FILE *fp);
 
 int dwarves__init(void);
@@ -1641,6 +1664,7 @@ const char *vmlinux_path__find_running_kernel(void);
 struct argp_state;
 
 void dwarves_print_version(FILE *fp, struct argp_state *state);
+void dwarves_print_devel_version(FILE *fp, struct argp_state *state);
 void dwarves_print_numeric_version(FILE *fp);
 
 extern bool print_numeric_version;

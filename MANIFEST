@@ -61,6 +61,7 @@ changes-v1.29
 changes-v1.30
 changes-v1.31
 buildcmd.sh
+build-and-test-cmd.sh
 COPYING
 NEWS
 README
@@ -81,3 +82,8 @@ libctf.h
 regtest
 lib/bpf/
 lib/include/bpf
+scripts/
+tests/bin/
+tests/tests
+tests/*.sh
+tests/.test-times.seed

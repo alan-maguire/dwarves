@@ -104,6 +104,7 @@ static int ctf__decompress(struct ctf *ctf, void *orig_buf, size_t orig_size)
 
 	if (inflate(&state, Z_FINISH) != Z_STREAM_END) {
 		err_str = "struct ctf decompression inflate failure.";
+		inflateEnd(&state);
 		goto err;
 	}
 
@@ -673,7 +674,7 @@ int ctf__encode(struct ctf *ctf, uint8_t flags)
 		if (shdr == NULL)
 			continue;
 		char *secname = elf_strptr(elf, strndx, shdr->sh_name);
-		if (strcmp(secname, ".SUNW_ctf") == 0) {
+		if (secname != NULL && strcmp(secname, ".SUNW_ctf") == 0) {
 			data = elf_getdata(scn, data);
 			goto out_update;
 		}
@@ -745,10 +746,9 @@ found_SUNW_ctf_str:
 	if (close(fd) < 0)
 		goto out_unlink;
 
-	char cmd[PATH_MAX * 2];
-	snprintf(cmd, sizeof(cmd), "objcopy --add-section .SUNW_ctf=%s %s",
-		 pathname, ctf->filename);
-	if (system(cmd) == 0)
+	char add_section[PATH_MAX + 32];
+	snprintf(add_section, sizeof(add_section), ".SUNW_ctf=%s", pathname);
+	if (exec_objcopy("objcopy", add_section, ctf->filename) == 0)
 		err = 0;
 out_unlink:
 	unlink(pathname);

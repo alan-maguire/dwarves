@@ -200,20 +200,46 @@ static int create_new_array(struct cu *cu, const struct btf_type *tp, uint32_t i
 	if (array == NULL)
 		return -ENOMEM;
 
-	/* FIXME: where to get the number of dimensions?
-	 * it it flattened? */
-	array->dimensions = 1;
-	array->nr_entries = malloc(sizeof(uint32_t));
+	/*
+	 * BTF encodes each dimension of a multi-dimensional array as a
+	 * separate BTF_KIND_ARRAY node chained via the element type field.
+	 * For example, int a[3][4] becomes:
+	 *   inner: BTF_KIND_ARRAY { type=int,   nelems=4 }
+	 *   outer: BTF_KIND_ARRAY { type=inner, nelems=3 }
+	 *
+	 * Reconstruct the pahole multi-dim representation (one array_type
+	 * with dimensions[] and nr_entries[]) by absorbing any inner
+	 * BTF_KIND_ARRAY that was already loaded.
+	 */
+	struct tag *elem_tag = cu__type(cu, ap->type);
 
-	if (array->nr_entries == NULL) {
-		free(array);
-		return -ENOMEM;
+	if (elem_tag && elem_tag->tag == DW_TAG_array_type &&
+	    tag__array_type(elem_tag)->dimensions < UINT8_MAX) {
+		struct array_type *inner = tag__array_type(elem_tag);
+
+		array->dimensions = inner->dimensions + 1;
+		array->nr_entries = malloc(array->dimensions * sizeof(uint32_t));
+		if (array->nr_entries == NULL) {
+			free(array);
+			return -ENOMEM;
+		}
+		array->nr_entries[0] = ap->nelems;
+		memcpy(&array->nr_entries[1], inner->nr_entries,
+		       inner->dimensions * sizeof(uint32_t));
+		/* point directly to the base element type, skipping the inner array node */
+		array->tag.type = inner->tag.type;
+	} else {
+		array->dimensions = 1;
+		array->nr_entries = malloc(sizeof(uint32_t));
+		if (array->nr_entries == NULL) {
+			free(array);
+			return -ENOMEM;
+		}
+		array->nr_entries[0] = ap->nelems;
+		array->tag.type = ap->type;
 	}
 
-	array->nr_entries[0] = ap->nelems;
 	array->tag.tag = DW_TAG_array_type;
-	array->tag.type = ap->type;
-
 	cu__add_tag_with_id(cu, &array->tag, id);
 
 	return 0;
@@ -428,8 +454,9 @@ static int create_new_datasec(struct cu *cu __maybe_unused, const struct btf_typ
 	//cu__add_tag_with_id(cu, &datasec->tag, id);
 
 	/*
-	 * FIXME: this will not be used to reconstruct some original C code,
-	 * its about runtime placement of variables so just ignore this for now
+	 * BTF_KIND_DATASEC describes runtime variable placement in ELF
+	 * sections, not C type information.  Not needed for pahole's
+	 * type reconstruction, so intentionally ignored.
 	 */
 	return 0;
 }
@@ -477,13 +504,50 @@ static struct attributes *attributes__realloc(struct attributes *attributes, con
 	return result;
 }
 
+static struct tag *ftype__parameter(const struct ftype *ftype, int component_idx)
+{
+	struct parameter *pos;
+	int idx = 0;
+
+	ftype__for_each_parameter(ftype, pos) {
+		if (idx == component_idx)
+			return &pos->tag;
+		++idx;
+	}
+
+	return NULL;
+}
+
+static struct tag *function__parameter(const struct function *func, struct cu *cu,
+				       int component_idx)
+{
+	struct tag *tag;
+
+	if (component_idx < 0)
+		return NULL;
+
+	tag = cu__type(cu, func->proto.tag.type);
+	if (tag == NULL)
+		return NULL;
+
+	return ftype__parameter(tag__ftype(tag), component_idx);
+}
+
 static int process_decl_tag(struct cu *cu, const struct btf_type *tp)
 {
+	int component_idx = btf_decl_tag(tp)->component_idx;
 	struct tag *tag = cu__type(cu, tp->type);
 	struct attributes *tmp;
 
-	if (tag == NULL)
-		tag = cu__function(cu, tp->type);
+	tag = cu__function(cu, tp->type);
+	if (component_idx >= 0 && tag != NULL) {
+		tag = function__parameter(tag__function(tag), cu, component_idx);
+		if (tag == NULL) {
+			fprintf(stderr, "WARNING: BTF_KIND_DECL_TAG for unknown parameter %d in BTF id %d\n",
+				component_idx, tp->type);
+			return 0;
+		}
+	}
 
 	if (tag == NULL)
 		tag = cu__tag(cu, tp->type);
@@ -707,7 +771,7 @@ static int class__fixup_btf_bitfields(const struct conf_load *conf, struct tag *
 		 */
 		smallest_offset = pos->byte_offset;
 		smallest_offset += pos->bitfield_size ?
-			(pos->bitfield_offset + pos->bitfield_size + 7) / 8 :
+			(size_t)(pos->bitfield_offset + pos->bitfield_size + 7) / 8 :
 			pos->byte_size;
 	}
 

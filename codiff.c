@@ -286,6 +286,9 @@ static void diff_struct(const struct cu *new_cu, struct class *structure,
 
 	assert(class__is_struct(new_structure));
 
+	class__find_holes(structure);
+	class__find_holes(new_structure);
+
 	diff = class__size(structure) != class__size(new_structure) ||
 	       class__nr_members(structure) != class__nr_members(new_structure) ||
 	       check_print_members_changes(structure, cu,
@@ -731,6 +734,11 @@ static const struct argp_option codiff__options[] = {
 		.doc  = "Show only differences, no difference? No output",
 	},
 	{
+		.name = "devel_version",
+		.key  = 300,
+		.doc  = "Print development version with git SHA (e.g., v1.31-189-g437fced33da3393e)",
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -745,6 +753,9 @@ static error_t codiff__options_parser(int key, char *arg __maybe_unused,
 	case 't': show_terse_type_changes = 1;	break;
 	case 'V': verbose = 1;			break;
 	case 'q': quiet = 1;			break;
+	case 300:
+		dwarves_print_devel_version(stdout, state);
+		exit(0);
 	default:  return ARGP_ERR_UNKNOWN;
 	}
 	return 0;

@@ -311,29 +311,6 @@ static struct ase_type_name_to_size {
 	{ .name = NULL },
 };
 
-bool base_type__language_defined(struct base_type *bt)
-{
-	int i = 0;
-	char bf[64];
-	const char *name;
-
-	if (bt->name_has_encoding)
-		name = bt->name;
-	else
-		name = base_type__name(bt, bf, sizeof(bf));
-
-	while (base_type_name_to_size_table[i].name != NULL) {
-		if (bt->name_has_encoding) {
-			if (strcmp(base_type_name_to_size_table[i].name, bt->name) == 0)
-				return true;
-		} else if (strcmp(base_type_name_to_size_table[i].name, name) == 0)
-			return true;
-		++i;
-	}
-
-	return false;
-}
-
 size_t base_type__name_to_size(struct base_type *bt, struct cu *cu)
 {
 	int i = 0;
@@ -428,6 +405,7 @@ void __type__init(struct type *type)
 	INIT_LIST_HEAD(&type->type_enum);
 	INIT_LIST_HEAD(&type->template_type_params);
 	INIT_LIST_HEAD(&type->template_value_params);
+	INIT_LIST_HEAD(&type->variant_parts);
 	type->template_parameter_pack = NULL;
 	type->sizeof_member = NULL;
 	type->member_prefix = NULL;
@@ -506,15 +484,6 @@ reevaluate:
 	return result;
 }
 
-static void cu__find_class_holes(struct cu *cu)
-{
-	uint32_t id;
-	struct class *pos;
-
-	cu__for_each_struct(cu, id, pos)
-		class__find_holes(pos);
-}
-
 struct cus {
 	uint32_t	 nr_entries;
 	struct list_head cus;
@@ -567,8 +536,6 @@ void cus__add(struct cus *cus, struct cu *cu)
 	cus__lock(cus);
 	__cus__add(cus, cu);
 	cus__unlock(cus);
-
-	cu__find_class_holes(cu);
 }
 
 static void ptr_table__init(struct ptr_table *pt)
@@ -985,27 +952,7 @@ found:
 	return pos;
 }
 
-struct tag *cus__find_type_by_name(struct cus *cus, struct cu **cu, const char *name,
-				   const int include_decls, type_id_t *id)
-{
-	struct cu *pos;
-	struct tag *tag = NULL;
-
-	cus__lock(cus);
-
-	list_for_each_entry(pos, &cus->cus, node) {
-		tag = cu__find_type_by_name(pos, name, include_decls, id);
-		if (tag != NULL) {
-			if (cu != NULL)
-				*cu = pos;
-			break;
-		}
-	}
-
-	cus__unlock(cus);
-
-	return tag;
-}
+/* cus__find_type_by_name removed: dead code, no callers */
 
 static struct tag *__cu__find_struct_by_name(const struct cu *cu, const char *name,
 					     const int include_decls, bool unions, type_id_t *idp)
@@ -1045,12 +992,6 @@ struct tag *cu__find_struct_by_name(const struct cu *cu, const char *name,
 	return __cu__find_struct_by_name(cu, name, include_decls, false, idp);
 }
 
-struct tag *cu__find_struct_or_union_by_name(const struct cu *cu, const char *name,
-						    const int include_decls, type_id_t *idp)
-{
-	return __cu__find_struct_by_name(cu, name, include_decls, true, idp);
-}
-
 static struct tag *__cus__find_struct_by_name(struct cus *cus, struct cu **cu, const char *name,
 					      const int include_decls, bool unions, type_id_t *id)
 {
@@ -1060,7 +1001,8 @@ static struct tag *__cus__find_struct_by_name(struct cus *cus, struct cu **cu, c
 	cus__lock(cus);
 
 	list_for_each_entry(pos, &cus->cus, node) {
-		struct tag *tag = __cu__find_struct_by_name(pos, name, include_decls, unions, id);
+		/* Don't shadow the outer 'tag' — we need to return it */
+		tag = __cu__find_struct_by_name(pos, name, include_decls, unions, id);
 		if (tag != NULL) {
 			if (cu != NULL)
 				*cu = pos;
@@ -1077,12 +1019,6 @@ struct tag *cus__find_struct_by_name(struct cus *cus, struct cu **cu, const char
 				     const int include_decls, type_id_t *idp)
 {
 	return __cus__find_struct_by_name(cus, cu, name, include_decls, false, idp);
-}
-
-struct tag *cus__find_struct_or_union_by_name(struct cus *cus, struct cu **cu, const char *name,
-					      const int include_decls, type_id_t *idp)
-{
-	return __cus__find_struct_by_name(cus, cu, name, include_decls, true, idp);
 }
 
 struct function *cu__find_function_at_addr(const struct cu *cu,
@@ -1142,19 +1078,6 @@ static struct cu *__cus__find_cu_by_name(struct cus *cus, const char *name)
 
 	pos = NULL;
 out:
-	return pos;
-}
-
-struct cu *cus__find_cu_by_name(struct cus *cus, const char *name)
-{
-	struct cu *pos;
-
-	cus__lock(cus);
-
-	pos = __cus__find_cu_by_name(cus, name);
-
-	cus__unlock(cus);
-
 	return pos;
 }
 
@@ -1288,12 +1211,31 @@ static void type__delete_class_members(struct type *type, struct cu *cu)
 	}
 }
 
+static void variant_part__delete(struct variant_part *vpart, struct cu *cu)
+{
+	if (vpart == NULL)
+		return;
+
+	cu__tag_free(cu, &vpart->tag);
+}
+
+static void type__delete_variant_parts(struct type *type, struct cu *cu)
+{
+	struct variant_part *pos, *next;
+
+	type__for_each_variant_part_safe_reverse(type, pos, next) {
+		list_del_init(&pos->tag.node);
+		variant_part__delete(pos, cu);
+	}
+}
+
 void class__delete(struct class *class, struct cu *cu)
 {
 	if (class == NULL)
 		return;
 
 	type__delete_class_members(&class->type, cu);
+	type__delete_variant_parts(&class->type, cu);
 	cu__tag_free(cu, class__tag(class));
 }
 
@@ -1303,6 +1245,7 @@ void type__delete(struct type *type, struct cu *cu)
 		return;
 
 	type__delete_class_members(type, cu);
+	type__delete_variant_parts(type, cu);
 
 	if (type->suffix_disambiguation)
 		zfree(&type->namespace.name);
@@ -1311,11 +1254,6 @@ void type__delete(struct type *type, struct cu *cu)
 	type->template_parameter_pack = NULL;
 
 	cu__tag_free(cu, type__tag(type));
-}
-
-static void enumerator__delete(struct enumerator *enumerator, struct cu *cu)
-{
-	cu__tag_free(cu, &enumerator->tag);
 }
 
 void enumeration__delete(struct type *type, struct cu *cu)
@@ -1327,7 +1265,7 @@ void enumeration__delete(struct type *type, struct cu *cu)
 
 	type__for_each_enumerator_safe_reverse(type, pos, n) {
 		list_del_init(&pos->tag.node);
-		enumerator__delete(pos, cu);
+		tag__delete(&pos->tag, cu);
 	}
 
 	if (type->suffix_disambiguation)
@@ -1366,6 +1304,11 @@ void type__add_template_value_param(struct type *type, struct template_value_par
 	list_add_tail(&tvparam->tag.node, &type->template_value_params);
 }
 
+void type__add_variant_part(struct type *type, struct variant_part *vpart)
+{
+	list_add_tail(&vpart->tag.node, &type->variant_parts);
+}
+
 struct class_member *type__last_member(struct type *type)
 {
 	struct class_member *pos;
@@ -1382,6 +1325,11 @@ static int type__clone_members(struct type *type, const struct type *from, struc
 
 	type->nr_members = type->nr_static_members = 0;
 	INIT_LIST_HEAD(&type->namespace.tags);
+	INIT_LIST_HEAD(&type->namespace.annots);
+	INIT_LIST_HEAD(&type->type_enum);
+	INIT_LIST_HEAD(&type->template_type_params);
+	INIT_LIST_HEAD(&type->template_value_params);
+	INIT_LIST_HEAD(&type->variant_parts);
 
 	type__for_each_member(from, pos) {
 		struct class_member *clone = class_member__clone(pos, cu);
@@ -1400,6 +1348,8 @@ struct class *class__clone(const struct class *from, const char *new_class_name,
 
 	 if (class != NULL) {
 		memcpy(class, from, sizeof(*class));
+		INIT_LIST_HEAD(&class->vtable);
+		class->nr_vtable_entries = 0;
 		if (new_class_name != NULL) {
 			class->type.namespace.name = strdup(new_class_name);
 			if (class->type.namespace.name == NULL) {
@@ -1418,6 +1368,13 @@ struct class *class__clone(const struct class *from, const char *new_class_name,
 
 void enumeration__add(struct type *type, struct enumerator *enumerator)
 {
+	/*
+	 * nr_members is the enumerator count, not the number of entries in the
+	 * enumeration namespace: DW_TAG_subprogram members of Rust enumerations
+	 * are added to the namespace but must not be counted here, since the
+	 * CTF encoder uses nr_members as the enum vlen and the fprintf/emit
+	 * paths rely on nr_members == 0 to detect forward declarations.
+	 */
 	++type->nr_members;
 	namespace__add_tag(&type->namespace, &enumerator->tag);
 }
@@ -1570,23 +1527,6 @@ bool class__has_flexible_array(struct class *class, const struct cu *cu)
 	}
 
 	return class->has_flexible_array;
-}
-
-const struct class_member *class__find_bit_hole(const struct class *class,
-					    const struct class_member *trailer,
-						const uint16_t bit_hole_size)
-{
-	struct class_member *pos;
-	const size_t byte_hole_size = bit_hole_size / 8;
-
-	type__for_each_data_member(&class->type, pos)
-		if (pos == trailer)
-			break;
-		else if (pos->hole >= byte_hole_size ||
-			 pos->bit_hole >= bit_hole_size)
-			return pos;
-
-	return NULL;
 }
 
 void class__find_holes(struct class *class)
@@ -1990,6 +1930,9 @@ static void enumeration__calc_prefix(struct type *enumeration)
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
+		if (entry->tag.tag != DW_TAG_enumerator)
+			continue;
+
 		const char *curr_name = enumerator__name(entry);
 
 		if (previous_name) {
@@ -2449,7 +2392,7 @@ const char *lang__int2str(int id)
 {
 	const char *lang = NULL;
 
-	if (id < ARRAY_SIZE(languages))
+	if (id >= 0 && (size_t)id < ARRAY_SIZE(languages))
 		lang = languages[id];
 	else if (id == DW_LANG_Mips_Assembler)
 		return "asm";
@@ -2504,7 +2447,7 @@ int languages__parse(struct languages *languages, const char *tool)
 
 		if (languages->nr_entries >= nr_allocated) {
 			nr_allocated *= 2;
-			int *entries = realloc(languages->entries, nr_allocated);
+			int *entries = realloc(languages->entries, nr_allocated * sizeof(int));
 
 			if (entries == NULL)
 				goto out_enomem;
@@ -3055,7 +2998,20 @@ struct argp_state;
 
 void dwarves_print_version(FILE *fp, struct argp_state *state __maybe_unused)
 {
+	// Always use major.minor version only for --version (kernel build compatibility)
 	fprintf(fp, "v%u.%u\n", DWARVES_MAJOR_VERSION, DWARVES_MINOR_VERSION);
+}
+
+void dwarves_print_devel_version(FILE *fp, struct argp_state *state __maybe_unused)
+{
+#ifdef DWARVES_GIT_DESCRIBE
+	// Use git describe output for --devel_version (includes tag, commit count, short SHA)
+	// Example: v1.31-181-gd917613c2f054f2f-dirty
+	fprintf(fp, "%s\n", DWARVES_GIT_DESCRIBE);
+#else
+	// Fall back to major.minor version only (release builds from tarballs)
+	fprintf(fp, "v%u.%u\n", DWARVES_MAJOR_VERSION, DWARVES_MINOR_VERSION);
+#endif
 }
 
 bool print_numeric_version;

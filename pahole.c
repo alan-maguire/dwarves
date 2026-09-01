@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <bpf/btf.h>
 #include "bpf/libbpf.h"
@@ -1042,7 +1043,7 @@ static int type__print_containers(struct type *type, struct cu *cu, uint32_t con
 		return 0;
 
 	if (ident == 0) {
-		bool existing_entry; // FIXME: This should really just search, no need to try to add it.
+		bool existing_entry;
 		struct structure *str = structures__add(type__class(type), cu, 0, &existing_entry);
 		if (str == NULL) {
 			fprintf(stderr, "pahole: insufficient memory for "
@@ -1102,6 +1103,8 @@ libbpf_print_all_levels(__maybe_unused enum libbpf_print_level level,
 /* Name and version of program.  */
 ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 
+#define ARGP_devel_version	   400
+
 #define ARGP_flat_arrays	   300
 #define ARGP_show_private_classes  301
 #define ARGP_fixup_silly_bitfields 302
@@ -1153,6 +1156,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARG_padding		   348
 #define ARGP_with_embedded_flexible_array 349
 #define ARGP_btf_attributes	   350
+#define ARGP_features		   351
 
 /* --btf_features=feature1[,feature2,..] allows us to specify
  * a list of requested BTF features or "default" to enable all default
@@ -1209,6 +1213,11 @@ static bool attributes_check(void)
 	return btf__add_type_attr != NULL;
 }
 
+static bool layout_check(void)
+{
+	return btf__new_empty_opts != NULL;
+}
+
 struct btf_feature {
 	const char      *name;
 	const char      *option_alias;
@@ -1235,6 +1244,8 @@ struct btf_feature {
 	BTF_NON_DEFAULT_FEATURE_CHECK(attributes, btf_attributes, false,
 				      attributes_check),
 	BTF_NON_DEFAULT_FEATURE(true_signature, true_signature, false),
+	BTF_NON_DEFAULT_FEATURE_CHECK(layout, btf_gen_layout, false, layout_check),
+	BTF_NON_DEFAULT_FEATURE(force_cu_merging, force_cu_merging, false),
 };
 
 #define BTF_MAX_FEATURE_STR	1024
@@ -1243,8 +1254,6 @@ bool set_btf_features_initial;
 
 static void init_btf_features(void)
 {
-	int i;
-
 	/* Only set initial values once, as multiple --btf_features=
 	 * may be specified on command-line, and setting values
 	 * again could clobber values.   The aim is to enable
@@ -1252,16 +1261,14 @@ static void init_btf_features(void)
 	 */
 	if (set_btf_features_initial)
 		return;
-	for (i = 0; i < ARRAY_SIZE(btf_features); i++)
+	for (size_t i = 0; i < ARRAY_SIZE(btf_features); i++)
 		*btf_features[i].conf_value = btf_features[i].initial_value;
 	set_btf_features_initial = true;
 }
 
 static struct btf_feature *find_btf_feature(char *name)
 {
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(btf_features); i++) {
 		if (strcmp(name, btf_features[i].name) == 0)
 			return &btf_features[i];
 	}
@@ -1279,9 +1286,7 @@ static void enable_btf_feature(struct btf_feature *feature)
 
 static void show_supported_btf_features(FILE *output)
 {
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(btf_features); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(btf_features); i++) {
 		if (btf_features[i].feature_check && !btf_features[i].feature_check())
 			continue;
 		if (i > 0)
@@ -1293,9 +1298,33 @@ static void show_supported_btf_features(FILE *output)
 
 static void btf_features__enable_default(void)
 {
-	for (int i = 0; i < ARRAY_SIZE(btf_features); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(btf_features); i++) {
 		if (btf_features[i].default_enabled)
 			enable_btf_feature(&btf_features[i]);
+	}
+}
+
+static void btf_features__enable_all(void)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(btf_features); i++) {
+		/* distilled_base requires a --btf_base argument to
+		 * provide the base BTF that btf__distill_base() will
+		 * split against.  Enabling it unconditionally causes
+		 * btf_encoder__encode() to call btf__distill_base()
+		 * on standalone objects like vmlinux, which returns
+		 * -EINVAL and makes pahole fail fatally.  Users who
+		 * want distilled_base must request it explicitly. */
+		if (btf_features[i].conf_value == &conf_load.btf_gen_distilled_base)
+			continue;
+		/* force_cu_merging forces the serialized, single-threaded
+		 * merged-CU loading path.  Enabling it unconditionally
+		 * with --btf_features=all or --btf_gen_all changes output
+		 * and slows loading for files that don't need CU merging.
+		 * Users who want force_cu_merging must request it
+		 * explicitly. */
+		if (btf_features[i].conf_value == &conf_load.force_cu_merging)
+			continue;
+		enable_btf_feature(&btf_features[i]);
 	}
 }
 
@@ -1312,6 +1341,11 @@ static void parse_btf_features(const char *features, bool strict)
 
 	if (strcmp(features, "default") == 0) {
 		btf_features__enable_default();
+		return;
+	}
+
+	if (strcmp(features, "all") == 0) {
+		btf_features__enable_all();
 		return;
 	}
 
@@ -1332,6 +1366,8 @@ static void parse_btf_features(const char *features, bool strict)
 			 */
 			if (strcmp(feature_name, "default") == 0) {
 				btf_features__enable_default();
+			} else if (strcmp(feature_name, "all") == 0) {
+				btf_features__enable_all();
 			} else if (strict) {
 				fprintf(stderr, "Feature '%s' in '%s' is not supported.  Supported BTF features are:\n",
 					feature_name, features);
@@ -1718,6 +1754,11 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "Print a numeric version, i.e. 119 instead of v1.19"
 	},
 	{
+		.name = "devel_version",
+		.key  = ARGP_devel_version,
+		.doc  = "Print development version with git SHA (e.g., v1.31-189-g437fced33da3393e)"
+	},
+	{
 		.name = "sort",
 		.key  = ARGP_sort_output,
 		.doc  = "Sort types by name",
@@ -1791,6 +1832,12 @@ static const struct argp_option pahole__options[] = {
 		.key = ARGP_btf_features,
 		.arg = "FEATURE_LIST",
 		.doc = "Specify supported BTF features in FEATURE_LIST or 'default' for default set of supported features. See the pahole manual page for the list of supported, default features."
+	},
+	{
+		.name = "features",
+		.key = ARGP_features,
+		.arg = "FEATURE_LIST",
+		.doc = "Specify supported features in FEATURE_LIST or 'default' for default set of supported features. See the pahole manual page for the list of supported, default features."
 	},
 	{
 		.name = "supported_btf_features",
@@ -1868,9 +1915,7 @@ static error_t pahole__options_parser(int key, char *arg,
 	case 'J': btf_encode = 1;
 		  conf_load.get_addr_info = true;
 		  conf_load.ignore_alignment_attr = true;
-		  // XXX for now, test this more thoroughly
-		  // We may have some references from formal parameters, etc, (abstract_origin)
-		  // conf_load.ignore_inline_expansions = true;
+		  conf_load.ignore_inline_expansions = true;
 		  conf_load.ignore_labels	     = true;
 		  conf_load.use_obstack		     = true;
 		  no_bitfield_type_recode = true;	break;
@@ -1966,6 +2011,9 @@ static error_t pahole__options_parser(int key, char *arg,
 		conf_load.kabi_prefix_len = strlen(arg); break;
 	case ARGP_numeric_version:
 		print_numeric_version = true;		break;
+	case ARGP_devel_version:
+		dwarves_print_devel_version(stdout, state);
+		exit(0);
 	case ARGP_btf_gen_floats:
 		conf_load.btf_gen_floats = true;	break;
 	case ARGP_btf_gen_all:
@@ -2006,6 +2054,7 @@ static error_t pahole__options_parser(int key, char *arg,
 		conf_load.reproducible_build = true;	break;
 	case ARGP_running_kernel_vmlinux:
 		show_running_kernel_vmlinux = true;	break;
+	case ARGP_features:
 	case ARGP_btf_features:
 		parse_btf_features(arg, false);		break;
 	case ARGP_supported_btf_features:
@@ -2140,7 +2189,7 @@ static const char *enumeration__lookup_value(struct type *enumeration, uint64_t 
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
-		if (entry->value == value)
+		if (entry->tag.tag == DW_TAG_enumerator && entry->value == value)
 			return enumerator__name(entry);
 	}
 
@@ -2165,7 +2214,7 @@ static struct enumerator *enumeration__lookup_entry_from_value(struct type *enum
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
-		if (entry->value == value)
+		if (entry->tag.tag == DW_TAG_enumerator && entry->value == value)
 			return entry;
 	}
 
@@ -2191,6 +2240,9 @@ static struct enumerator *enumeration__find_enumerator(struct type *enumeration,
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
+		if (entry->tag.tag != DW_TAG_enumerator)
+			continue;
+
 		const char *entry_name = enumerator__name(entry);
 
 		if (!strcmp(entry_name, name))
@@ -2350,6 +2402,13 @@ static int pipe_seek(FILE *fp, off_t offset)
 	char bf[4096];
 	int chunk = sizeof(bf);
 
+	/* Negative offset would wrap chunk to a huge size_t in fread() */
+	if (offset < 0)
+		return -1;
+
+	if (offset == 0)
+		return 0;
+
 	if (chunk > offset)
 		chunk = offset;
 
@@ -2360,6 +2419,11 @@ static int pipe_seek(FILE *fp, off_t offset)
 		if (chunk > offset)
 			chunk = offset;
 	}
+
+	/* On EOF (not I/O error), clear errno so callers don't
+	 * pick up a stale value from an earlier successful fread. */
+	if (!ferror(fp))
+		errno = 0;
 
 	return offset == 0 ? 0 : -1;
 }
@@ -2579,15 +2643,22 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 	uint64_t size_bytes = ULLONG_MAX;
 	uint32_t count = 0;
 	uint32_t skip = conf.skip;
+	/* Bytes consumed from input so far, for absolute→relative seek on pipes */
+	off_t consumed = 0;
+	int64_t header_bytes;
 
 	if (instance == NULL)
 		return -ENOMEM;
 
-	if (type__instance_read_once(header, input) < 0) {
-		int err = --errno;
+	/* Keep consumed in sync with bytes actually fread'd from input */
+	errno = 0;
+	header_bytes = type__instance_read_once(header, input);
+	if (header_bytes < 0) {
+		printed = errno ? -errno : -EIO;
 		fprintf(stderr, "pahole: --header (%s) type couldn't be read\n", conf.header_type);
-		return err;
+		goto out;
 	}
+	consumed = header_bytes;
 
 	if (conf.range || prototype->range) {
 		off_t seek_bytes;
@@ -2598,14 +2669,16 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 				fprintf(stderr, "pahole: --header_type=%s not found\n", conf.header_type);
 			else
 				fprintf(stderr, "pahole: range (%s) requires --header\n", range);
-			return -ESRCH;
+			printed = -ESRCH;
+			goto out;
 		}
 
 		char *member_name = NULL;
 
 		if (asprintf(&member_name, "%s.%s", range, "offset") == -1) {
 			fprintf(stderr, "pahole: not enough memory for range=%s\n", range);
-			return -ENOMEM;
+			printed = -ENOMEM;
+			goto out;
 		}
 
 		int64_t value = type_instance__int_value(header, member_name);
@@ -2614,33 +2687,52 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			fprintf(stderr, "pahole: couldn't read the '%s' member of '%s' for evaluating range=%s\n",
 				member_name, conf.header_type, range);
 			free(member_name);
-			return -ESRCH;
+			printed = -ESRCH;
+			goto out;
 		}
 
 		seek_bytes = value;
 
 		free(member_name);
 
-		off_t total_read_bytes = ftell(input);
-
-		// Since we're reading input, we need to account for what we already read
-		// FIXME: we now have a FILE pointer that _may_ be stdin, but not necessarily
-		if (seek_bytes < total_read_bytes) {
-			fprintf(stderr, "pahole: can't go back in input, already read %" PRIu64 " bytes, can't go to position %#" PRIx64 "\n",
-					total_read_bytes, seek_bytes);
-			return -ENOMEM;
-		}
-
 		if (global_verbose) {
 			fprintf(output, "pahole: range.seek_bytes evaluated from range=%s is %#" PRIx64 " \n",
 				range, seek_bytes);
 		}
 
-		seek_bytes -= total_read_bytes;
+		/*
+		 * Use fseek() for seekable files (regular files opened
+		 * by path).  Fall back to forward-reading pipe_seek()
+		 * for non-seekable streams (stdin, pipes).
+		 */
+		if (fseeko(input, seek_bytes, SEEK_SET) != 0) {
+			if (seek_bytes < consumed) {
+				fprintf(stderr, "pahole: can't seek backward in non-seekable input, already read %" PRId64 " bytes, target %#" PRIx64 "\n",
+						(int64_t)consumed, seek_bytes);
+				printed = -ESPIPE;
+				goto out;
+			}
+
+			errno = 0;
+			if (pipe_seek(input, seek_bytes - consumed) < 0) {
+				printed = errno ? -errno : -EIO;
+				fprintf(stderr, "Couldn't seek to offset %" PRId64 " for range=%s\n", (int64_t)seek_bytes, range);
+				goto out;
+			}
+		} else {
+			struct stat sb;
+			if (fstat(fileno(input), &sb) == 0 && S_ISREG(sb.st_mode) && seek_bytes >= sb.st_size) {
+				fprintf(stderr, "pahole: seek offset %" PRId64 " is beyond file size %" PRId64 " for range=%s\n",
+						(int64_t)seek_bytes, (int64_t)sb.st_size, range);
+				printed = -EINVAL;
+				goto out;
+			}
+		}
 
 		if (asprintf(&member_name, "%s.%s", range, "size") == -1) {
 			fprintf(stderr, "pahole: not enough memory for range=%s\n", range);
-			return -ENOMEM;
+			printed = -ENOMEM;
+			goto out;
 		}
 
 		value = type_instance__int_value(header, member_name);
@@ -2649,7 +2741,8 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			fprintf(stderr, "pahole: couldn't read the '%s' member of '%s' for evaluating range=%s\n",
 				member_name, conf.header_type, range);
 			free(member_name);
-			return -ESRCH;
+			printed = -ESRCH;
+			goto out;
 		}
 
 		size_bytes = value;
@@ -2659,12 +2752,6 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 		}
 
 		free(member_name);
-
-		if (pipe_seek(input, seek_bytes) < 0) {
-			int err = --errno;
-			fprintf(stderr, "Couldn't --seek_bytes %s (%" PRIu64 "\n", conf.seek_bytes, seek_bytes);
-			return err;
-		}
 
 		goto do_read;
 	}
@@ -2676,7 +2763,8 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			if (!header) {
 				fprintf(stderr, "pahole: --seek_bytes (%s) makes reference to --header but it wasn't specified\n",
 					conf.seek_bytes);
-				return -ESRCH;
+				printed = -ESRCH;
+				goto out;
 			}
 
 			const char *member_name = conf.seek_bytes + sizeof("$header.") - 1;
@@ -2684,7 +2772,8 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			if (value < 0) {
 				fprintf(stderr, "pahole: couldn't read the '%s' member of '%s' for evaluating --seek_bytes=%s\n",
 					member_name, conf.header_type, conf.seek_bytes);
-				return -ESRCH;
+				printed = -ESRCH;
+				goto out;
 			}
 
 			seek_bytes = value;
@@ -2696,22 +2785,40 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			if (seek_bytes < header->type->size) {
 				fprintf(stderr, "pahole: seek bytes evaluated from --seek_bytes=%s is less than the header type size\n",
 					conf.seek_bytes);
-				return -EINVAL;
+				printed = -EINVAL;
+				goto out;
 			}
 		} else  {
 			seek_bytes = strtol(conf.seek_bytes, NULL, 0);
 		}
 
 
-		if (header) {
-			// Since we're reading input, we need to account for already read header:
-			seek_bytes -= ftell(input);
-		}
+		/*
+		 * Use fseek() for seekable files, fall back to
+		 * forward-reading pipe_seek() for pipes/stdin.
+		 */
+		if (fseeko(input, seek_bytes, SEEK_SET) != 0) {
+			if (seek_bytes < consumed) {
+				fprintf(stderr, "pahole: can't seek backward in non-seekable input, already read %" PRId64 " bytes, target %#" PRIx64 "\n",
+						(int64_t)consumed, seek_bytes);
+				printed = -ESPIPE;
+				goto out;
+			}
 
-		if (pipe_seek(input, seek_bytes) < 0) {
-			int err = --errno;
-			fprintf(stderr, "Couldn't --seek_bytes %s (%" PRIu64 "\n", conf.seek_bytes, seek_bytes);
-			return err;
+			errno = 0;
+			if (pipe_seek(input, seek_bytes - consumed) < 0) {
+				printed = errno ? -errno : -EIO;
+				fprintf(stderr, "Couldn't --seek_bytes %s (%" PRId64 ")\n", conf.seek_bytes, (int64_t)seek_bytes);
+				goto out;
+			}
+		} else {
+			struct stat sb;
+			if (fstat(fileno(input), &sb) == 0 && S_ISREG(sb.st_mode) && seek_bytes >= sb.st_size) {
+				fprintf(stderr, "pahole: --seek_bytes %" PRId64 " is beyond file size %" PRId64 "\n",
+						(int64_t)seek_bytes, (int64_t)sb.st_size);
+				printed = -EINVAL;
+				goto out;
+			}
 		}
 	}
 
@@ -2720,7 +2827,8 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			if (!header) {
 				fprintf(stderr, "pahole: --size_bytes (%s) makes reference to --header but it wasn't specified\n",
 					conf.size_bytes);
-				return -ESRCH;
+				printed = -ESRCH;
+				goto out;
 			}
 
 			const char *member_name = conf.size_bytes + sizeof("$header.") - 1;
@@ -2728,7 +2836,8 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 			if (value < 0) {
 				fprintf(stderr, "pahole: couldn't read the '%s' member of '%s' for evaluating --size_bytes=%s\n",
 					member_name, conf.header_type, conf.size_bytes);
-				return -ESRCH;
+				printed = -ESRCH;
+				goto out;
 			}
 
 			size_bytes = value;
@@ -3189,7 +3298,7 @@ static bool print_enumeration_with_enumerator(struct cu *cu, const char *name)
 
 	cu__for_each_enumeration(cu, id, enumeration) {
 		if (enumeration__find_enumerator(enumeration, name) != NULL) {
-			enumeration__fprintf(type__tag(enumeration), &conf, stdout);
+			enumeration__fprintf(type__tag(enumeration), cu, &conf, stdout);
 			fputc('\n', stdout);
 			return true;
 		}

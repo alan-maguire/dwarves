@@ -426,7 +426,7 @@ static int cu_function_iterator(struct cu *cu, void *cookie __maybe_unused)
 	return 0;
 }
 
-int elf_symtab__show(char *filename)
+static int elf_symtab__show(char *filename)
 {
 	int fd = open(filename, O_RDONLY), err = -1;
 	if (fd < 0)
@@ -494,7 +494,7 @@ out_close:
 	return err;
 }
 
-int elf_symtabs__show(char *filenames[])
+static int elf_symtabs__show(char *filenames[])
 {
 	int i = 0;
 
@@ -543,6 +543,7 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_symtab		300
 #define ARGP_no_parm_names	301
 #define ARGP_compile		302
+#define ARGP_devel_version	303
 
 static const struct argp_option pfunct__options[] = {
 	{
@@ -674,6 +675,11 @@ static const struct argp_option pfunct__options[] = {
 		.doc   = "Don't show parameter names",
 	},
 	{
+		.name = "devel_version",
+		.key  = ARGP_devel_version,
+		.doc  = "Print development version with git SHA (e.g., v1.31-189-g437fced33da3393e)",
+	},
+	{
 		.name = NULL,
 	}
 };
@@ -731,6 +737,9 @@ static error_t pfunct__options_parser(int key, char *arg,
 		  if (arg)
 			  function_name = arg;
 		  break;
+	case ARGP_devel_version:
+		  dwarves_print_devel_version(stdout, state);
+		  exit(0);
 	default:  return ARGP_ERR_UNKNOWN;
 	}
 

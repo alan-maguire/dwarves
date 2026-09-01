@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 project(pahole C)
 cmake_policy(SET CMP0005 NEW)
 
@@ -38,6 +38,19 @@ set(CMAKE_C_FLAGS_DEBUG "-Wall -Werror -ggdb -O0")
 set(CMAKE_C_FLAGS_RELEASE "-Wall -O2")
 SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread")
 
+option(ENABLE_COVERAGE "Enable LLVM source-based code coverage (requires Clang)" OFF)
+if(ENABLE_COVERAGE)
+	if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+		message(FATAL_ERROR "ENABLE_COVERAGE requires Clang. Use: cmake -DCMAKE_C_COMPILER=clang -DENABLE_COVERAGE=ON ..")
+	endif()
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-instr-generate -fcoverage-mapping")
+	set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fprofile-instr-generate")
+	set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fprofile-instr-generate")
+	# Warn loudly — coverage instrumentation adds ~4x overhead and
+	# destroys parallel scaling due to profile counter false sharing.
+	message(WARNING "COVERAGE BUILD: instrumentation is ON, performance will be severely degraded")
+endif()
+
 if (NOT DEFINED BUILD_SHARED_LIBS)
 	set (BUILD_SHARED_LIBS ON)
 	message(STATUS "Setting BUILD_SHARED_LIBS = ${BUILD_SHARED_LIBS}")
@@ -72,6 +85,45 @@ if(LIBBPF_EMBEDDED AND GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
 endif()
 if(NOT LIBBPF_FOUND AND NOT EXISTS "${PROJECT_SOURCE_DIR}/lib/bpf/src/btf.h")
 	message(FATAL_ERROR "The submodules were not downloaded! GIT_SUBMODULE was turned off or failed. Please update submodules and try again.")
+endif()
+
+# Capture git SHA for version tracking (especially for non-release builds)
+# Use git describe to get tag + commit count + short SHA for version string
+if(GIT_FOUND AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
+	execute_process(
+		COMMAND ${GIT_EXECUTABLE} describe --long --dirty --tags
+		WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+		OUTPUT_VARIABLE GIT_DESCRIBE
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+		ERROR_QUIET
+	)
+	execute_process(
+		COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+		WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+		OUTPUT_VARIABLE GIT_SHA
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+		ERROR_QUIET
+	)
+	if(GIT_DESCRIBE)
+		add_definitions(-DDWARVES_GIT_DESCRIBE="${GIT_DESCRIBE}")
+		message(STATUS "Version: ${GIT_DESCRIBE}")
+	endif()
+	if(GIT_SHA)
+		add_definitions(-DDWARVES_GIT_SHA="${GIT_SHA}")
+	endif()
+elseif(EXISTS "${PROJECT_SOURCE_DIR}/HEAD")
+	# Tarball build: use HEAD file created during tarball generation
+	file(READ "${PROJECT_SOURCE_DIR}/HEAD" GIT_SHA)
+	string(STRIP "${GIT_SHA}" GIT_SHA)
+	if(GIT_SHA)
+		add_definitions(-DDWARVES_GIT_SHA="${GIT_SHA}")
+		# Use v<major>.<minor>-<short-sha> format for tarball builds
+		# DWARVES_MAJOR_VERSION/MINOR_VERSION are compiler defines, not
+		# CMake variables, so hardcode the version here.
+		string(SUBSTRING "${GIT_SHA}" 0 12 SHORT_SHA)
+		add_definitions(-DDWARVES_GIT_DESCRIBE="v1.31-tarball-g${SHORT_SHA}")
+		message(STATUS "Version: v1.31-tarball-g${SHORT_SHA} (from HEAD file)")
+	endif()
 endif()
 
 # libbpf uses reallocarray, which is not available in all versions of glibc
@@ -181,3 +233,88 @@ endif()
 install(PROGRAMS btfdiff fullcircle DESTINATION ${CMAKE_INSTALL_PREFIX}/bin)
 install(FILES lib/Makefile lib/ctracer_relay.c lib/ctracer_relay.h lib/linux.blacklist.cu
 	DESTINATION ${CMAKE_INSTALL_PREFIX}/share/dwarves/runtime)
+
+# ── Test and coverage targets ────────────────────────────────────────
+
+add_custom_target(check
+	COMMAND ${CMAKE_COMMAND} -E env "PATH=${CMAKE_BINARY_DIR}:$ENV{PATH}"
+		${CMAKE_SOURCE_DIR}/tests/tests
+	DEPENDS pahole pfunct pdwtags pglobal codiff
+	WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+	USES_TERMINAL
+	COMMENT "Running test suite")
+
+add_custom_target(coverage
+	COMMAND ${CMAKE_SOURCE_DIR}/coverage/coverage-diff.sh
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Full coverage: rebuild with instrumentation, run tests, report")
+
+add_custom_target(coverage-report
+	COMMAND ${CMAKE_SOURCE_DIR}/coverage/coverage-diff.sh --report-only
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Regenerate coverage report from existing profdata")
+
+add_custom_target(coverage-table
+	COMMAND ${CMAKE_SOURCE_DIR}/scripts/coverage_table.py
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Display ASCII coverage table from existing profdata")
+
+# ── Tarball targets ──────────────────────────────────────────────────
+
+add_custom_target(tarxz-pkg
+	COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-tarball.sh xz
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Create .tar.xz release tarball in the current directory")
+
+add_custom_target(targz-pkg
+	COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-tarball.sh gz
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Create .tar.gz release tarball in the current directory")
+
+add_custom_target(tarbz2-pkg
+	COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-tarball.sh bz2
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Create .tar.bz2 release tarball in the current directory")
+
+add_custom_target(tar-pkg
+	COMMAND ${CMAKE_SOURCE_DIR}/scripts/make-tarball.sh tar
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	USES_TERMINAL
+	COMMENT "Create .tar release tarball in the current directory")
+
+# ── Help target ──────────────────────────────────────────────────────
+
+add_custom_target(list-targets
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	COMMAND ${CMAKE_COMMAND} -E echo "pahole build targets:"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make                  - Build all binaries and libraries"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make install          - Install to CMAKE_INSTALL_PREFIX"
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	COMMAND ${CMAKE_COMMAND} -E echo "Testing:"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make check            - Run the test suite"
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	COMMAND ${CMAKE_COMMAND} -E echo "Coverage:"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make coverage         - Full coverage: rebuild, run tests, report diff"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make coverage-report  - Regenerate report from existing profdata"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make coverage-table   - Display ASCII coverage table"
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	COMMAND ${CMAKE_COMMAND} -E echo "  Coverage uses build-coverage/ as the instrumented build directory."
+	COMMAND ${CMAKE_COMMAND} -E echo "  Set BUILD_DIR to override."
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	COMMAND ${CMAKE_COMMAND} -E echo "Tarball generation:"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make tarxz-pkg        - Create .tar.xz release tarball"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make targz-pkg        - Create .tar.gz release tarball"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make tarbz2-pkg       - Create .tar.bz2 release tarball"
+	COMMAND ${CMAKE_COMMAND} -E echo "  make tar-pkg          - Create .tar release tarball"
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	COMMAND ${CMAKE_COMMAND} -E echo "  Tarballs created in current directory by default. Set TARBALL_DIR to override."
+	COMMAND ${CMAKE_COMMAND} -E echo "  See README.tarball for details."
+	COMMAND ${CMAKE_COMMAND} -E echo ""
+	WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+	COMMENT "")
