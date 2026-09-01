@@ -43,6 +43,13 @@
 #define BTF_FASTCALL_TAG       "bpf_fastcall"
 #define BPF_ARENA_ATTR         "address_space(1)"
 
+#define BTF_LOC_PARAM_SIGNED	0x1
+#define BTF_LOC_PARAM_CONST	0x2
+#define BTF_LOC_PARAM_ADDR	0x4
+#define BTF_LOC_PARAM_REG	0x8
+#define BTF_LOC_PARAM_DEREF	0x10
+#define BTF_LOC_PARAM_OFFSET	0x20
+
 /* kfunc flags, see include/linux/btf.h in the kernel source */
 #define KF_FASTCALL   (1 << 12)
 #define KF_ARENA_RET  (1 << 13)
@@ -77,6 +84,23 @@ struct btf_encoder_func_annot {
 	int16_t component_idx;
 };
 
+struct loc_param {
+	uint32_t flags;
+	uint32_t values[2];
+	uint8_t nvalues;
+	uint8_t size;
+};
+
+struct loc {
+	char *name;
+	struct loc_param *params;
+	uint16_t nparams;
+	int func_id;
+	int loc_proto_id;
+	uint32_t section_idx;
+	uint32_t section_offset;
+};
+
 struct elf_function_sym {
 	const char *name;
 	uint64_t addr;
@@ -86,6 +110,7 @@ struct elf_function_sym {
 struct btf_encoder_func_state {
 	struct elf_function *elf;
 	struct elf_function_sym *sym;
+	struct loc *loc;
 	uint64_t addr;
 	uint32_t type_id_off;
 	uint16_t nr_parms;
@@ -103,6 +128,12 @@ struct btf_encoder_func_state {
 	struct btf_encoder_func_annot *annots;
 };
 
+struct btf_encoder_func_states {
+	struct btf_encoder_func_state *array;
+	int cnt;
+	int cap;
+};
+
 struct elf_function {
 	char		*name;
 	struct elf_function_sym *syms;
@@ -116,6 +147,7 @@ struct elf_secinfo {
 	uint64_t    addr;
 	const char *name;
 	uint64_t    sz;
+	uint64_t    flags;
 	uint32_t    type;
 	bool        include;
 	struct gobuffer secinfo;
@@ -176,17 +208,16 @@ struct btf_encoder {
 	struct elf_secinfo *secinfo;
 	size_t             seccnt;
 	int                encode_vars;
-	struct {
-		struct btf_encoder_func_state *array;
-		int cnt;
-		int cap;
-	} func_states;
+	struct btf_encoder_func_states func_states;
+	struct btf_encoder_func_states loc_states;
 	/* This is a list of elf_functions tables, one per ELF.
 	 * Multiple ELF modules can be processed in one pahole run,
 	 * so we have to store elf_functions tables per ELF.
 	 */
 	struct list_head elf_functions_list;
 };
+
+static int btf_encoder__add_locsec(struct btf_encoder *encoder);
 
 /* Half open interval representing range of addresses containing kfuncs */
 struct btf_kfunc_set_range {
@@ -324,6 +355,9 @@ static const char * const btf_kind_str[] = {
 	[BTF_KIND_DECL_TAG]     = "DECL_TAG",
 	[BTF_KIND_TYPE_TAG]     = "TYPE_TAG",
 	[BTF_KIND_ENUM64]	= "ENUM64",
+	[BTF_KIND_LOC_PARAM]	= "LOC_PARAM",
+	[BTF_KIND_LOC_PROTO]	= "LOC_PROTO",
+	[BTF_KIND_LOCSEC]	= "LOCSEC",
 };
 
 static const char *btf__printable_name(const struct btf *btf, uint32_t offset)
@@ -938,8 +972,10 @@ static int32_t btf_encoder__add_func_proto_for_state(struct btf_encoder *encoder
 		 * name string memory, so make a temporary copy.
 		 */
 		strncpy(tmp_name, name, sizeof(tmp_name) - 1);
+		tmp_name[sizeof(tmp_name) - 1] = '\0';
 
-		if (btf_encoder__add_func_param(encoder, tmp_name, p->type_id, is_last))
+		type_id = p->type_id;
+		if (btf_encoder__add_func_param(encoder, tmp_name, type_id, is_last))
 			return -1;
 	}
 
@@ -1216,29 +1252,55 @@ static bool funcs__match(struct btf_encoder *encoder,
 	return true;
 }
 
-static struct btf_encoder_func_state *btf_encoder__alloc_func_state(struct btf_encoder *encoder)
+static struct btf_encoder_func_state *
+btf_encoder__alloc_func_state(struct btf_encoder_func_states *func_states)
 {
 	struct btf_encoder_func_state *state, *tmp;
 
-	if (encoder->func_states.cnt >= encoder->func_states.cap) {
+	if (func_states->cnt >= func_states->cap) {
 
 		/* We only need to grow to accommodate duplicate
 		 * function declarations across different CUs, so the
 		 * rate of the array growth shouldn't be high.
 		 */
-		encoder->func_states.cap += 64;
+		func_states->cap += 64;
 
-		tmp = realloc(encoder->func_states.array, sizeof(*tmp) * encoder->func_states.cap);
+		tmp = realloc(func_states->array, sizeof(*tmp) * func_states->cap);
 		if (!tmp)
 			return NULL;
 
-		encoder->func_states.array = tmp;
+		func_states->array = tmp;
 	}
 
-	state = &encoder->func_states.array[encoder->func_states.cnt++];
+	state = &func_states->array[func_states->cnt++];
 	memset(state, 0, sizeof(*state));
 
 	return state;
+}
+
+static void loc__delete(struct loc *loc)
+{
+	if (!loc)
+		return;
+	free(loc->name);
+	free(loc->params);
+	free(loc);
+}
+
+static void btf_encoder_func_state__clear(struct btf_encoder_func_state *state)
+{
+	free(state->parms);
+	free(state->annots);
+	loc__delete(state->loc);
+	memset(state, 0, sizeof(*state));
+}
+
+static void btf_encoder__drop_func_state(struct btf_encoder_func_states *func_states,
+					 struct btf_encoder_func_state *state)
+{
+	btf_encoder_func_state__clear(state);
+	if (func_states->cnt > 0 && state == &func_states->array[func_states->cnt - 1])
+		func_states->cnt--;
 }
 
 static bool str_contains_suffix(const char *str, const char * const *suffixes, size_t nr_suffixes)
@@ -1298,9 +1360,11 @@ static bool elf_function__has_ambiguous_address(struct elf_function *func)
 	return false;
 }
 
-static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn, struct elf_function *func)
+static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct function *fn,
+				      struct elf_function *func, struct loc *loc)
 {
-	struct btf_encoder_func_state *state = btf_encoder__alloc_func_state(encoder);
+	struct btf_encoder_func_states *func_states = loc ? &encoder->loc_states : &encoder->func_states;
+	struct btf_encoder_func_state *state = btf_encoder__alloc_func_state(func_states);
 	struct ftype *ftype = &fn->proto;
 	struct btf *btf = encoder->btf;
 	struct llvm_annotation *annot;
@@ -1313,6 +1377,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 
 	state->addr = function__addr(fn);
 	state->elf = func;
+	state->loc = loc;
 	state->nr_parms = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
 	state->ret_type_id = btf_encoder__tag_type(encoder, ftype->tag.type);
 	if (state->nr_parms > 0) {
@@ -1322,7 +1387,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 			goto out;
 		}
 	}
-	if (encoder->true_signature && state->addr) {
+	if (encoder->true_signature && state->addr && func) {
 		int i;
 
 		for (i = 0; i < func->sym_cnt; i++) {
@@ -1344,7 +1409,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	state->uncertain_parm_loc = ftype->uncertain_parm_loc;
 	state->reordered_parm = ftype->reordered_parm;
 	state->signature_changed = ftype->signature_changed;
-	if (state->addr) {
+	if (state->addr && func) {
 		for (int i = 0; i < func->sym_cnt; i++) {
 			if (state->addr != func->syms[i].addr)
 				continue;
@@ -1359,11 +1424,11 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 		char *final_name = NULL;
 
 		/* No location info/optimized + reordered means optimized out. */
-		if (ftype->reordered_parm && (!param->has_loc || param->optimized)) {
+		if (!loc && ftype->reordered_parm && (!param->has_loc || param->optimized)) {
 			state->nr_parms--;
 			continue;
 		}
-		if (encoder->true_signature && ftype->signature_changed && param->optimized) {
+		if (!loc && encoder->true_signature && ftype->signature_changed && param->optimized) {
 			state->nr_parms--;
 			continue;
 		}
@@ -1399,6 +1464,9 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	if (ftype->unspec_parms)
 		state->parms[param_idx].type_id = 0;
 
+	if (loc)
+		return 0;
+
 	list_for_each_entry(annot, &fn->annots, node)
 		state->nr_annots++;
 	if (state->nr_annots) {
@@ -1422,21 +1490,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	}
 	return 0;
 out:
-	/*
-	 * state is an interior pointer into func_states.array (returned by
-	 * btf_encoder__alloc_func_state), not a standalone allocation.
-	 * Calling free(state) here was heap corruption.
-	 *
-	 * Since no further func_state allocations happen between the alloc
-	 * at the top of this function and this error path, state is always
-	 * the last element (index cnt-1), so decrementing cnt releases it.
-	 * If this invariant ever changes (e.g. nested alloc calls are added),
-	 * this cleanup must be revised.
-	 */
-	zfree(&state->annots);
-	zfree(&state->parms);
-	memset(state, 0, sizeof(*state));
-	encoder->func_states.cnt--;
+	btf_encoder__drop_func_state(func_states, state);
 	return err;
 }
 
@@ -1600,21 +1654,14 @@ static int saved_functions_combine(struct btf_encoder *encoder,
 	return 0;
 }
 
-static void btf_encoder__delete_saved_funcs(struct btf_encoder *encoder)
+static void btf_encoder__delete_func_states(struct btf_encoder_func_states *func_states)
 {
-	struct btf_encoder_func_state *state;
-
-	for (int i = 0; i < encoder->func_states.cnt; i++) {
-		state = &encoder->func_states.array[i];
-		free(state->parms);
-		free(state->annots);
-	}
-
-	free(encoder->func_states.array);
-
-	encoder->func_states.array = NULL;
-	encoder->func_states.cnt = 0;
-	encoder->func_states.cap = 0;
+	for (int i = 0; i < func_states->cnt; i++)
+		btf_encoder_func_state__clear(&func_states->array[i]);
+	free(func_states->array);
+	func_states->array = NULL;
+	func_states->cnt = 0;
+	func_states->cap = 0;
 }
 
 /*
@@ -1784,7 +1831,7 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder, bool skip_e
 	}
 
 out:
-	btf_encoder__delete_saved_funcs(encoder);
+	btf_encoder__delete_func_states(&encoder->func_states);
 
 	return err;
 }
@@ -2466,6 +2513,11 @@ int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 	err = btf_encoder__add_saved_funcs(encoder, conf->skip_encoding_btf_inconsistent_proto);
 	if (err < 0)
 		return err;
+	if (encoder->loc_states.cnt) {
+		err = btf_encoder__add_locsec(encoder);
+		if (err)
+			return err;
+	}
 
 	for (shndx = 1; shndx < encoder->seccnt; shndx++)
 		if (gobuffer__size(&encoder->secinfo[shndx].secinfo))
@@ -2675,7 +2727,7 @@ static size_t get_elf_section(struct btf_encoder *encoder, uint64_t addr)
  * values. Prefixes should be added sparingly, and it should be objectively
  * obvious that they are not useful.
  */
-static bool filter_variable_name(const char *name)
+static bool filter_name(const char *name)
 {
 	static const struct { char *s; size_t len; } skip[] = {
 		#define X(str) {str, sizeof(str) - 1}
@@ -2783,7 +2835,7 @@ static int btf_encoder__encode_cu_variables(struct btf_encoder *encoder)
 		if (!name)
 			continue;
 
-		if (filter_variable_name(name))
+		if (filter_name(name))
 			continue;
 
 		/* A 0 address may be in a "discard" section; DWARF provides
@@ -2979,6 +3031,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 				goto out_delete;
 			encoder->secinfo[shndx].addr = shdr.sh_addr;
 			encoder->secinfo[shndx].sz = shdr.sh_size;
+			encoder->secinfo[shndx].flags = shdr.sh_flags;
 			encoder->secinfo[shndx].name = secname;
 			encoder->secinfo[shndx].type = shdr.sh_type;
 
@@ -3030,7 +3083,8 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 
 	elf_functions_list__clear(&encoder->elf_functions_list);
 
-	btf_encoder__delete_saved_funcs(encoder);
+	btf_encoder__delete_func_states(&encoder->func_states);
+	btf_encoder__delete_func_states(&encoder->loc_states);
 
 	free(encoder);
 }
@@ -3065,6 +3119,175 @@ static bool ftype__has_uncertain_arg_loc(struct cu *cu, struct ftype *ftype)
 	}
 
 	return false;
+}
+
+#define BTF_LOC_PARAM_FBREG	(DW_OP_fbreg - DW_OP_breg0)
+
+static int btf_encoder__add_loc_param(struct parameter *param, uint64_t base,
+				      struct loc_param *lp)
+{
+	uint8_t size = param->loc_size ?: sizeof(uint64_t);
+	uint64_t value;
+
+	memset(lp, 0, sizeof(*lp));
+	if ((param->loc_const_value || param->has_const_value) && param->loc_size) {
+		value = param->loc_value;
+		lp->size = size;
+		lp->flags = BTF_LOC_PARAM_CONST;
+		if (param->loc_addr) {
+			lp->flags |= BTF_LOC_PARAM_ADDR;
+			if (value >= base)
+				value -= base;
+		}
+		if (param->loc_signed)
+			lp->flags |= BTF_LOC_PARAM_SIGNED;
+		lp->values[lp->nvalues++] = value;
+		if (lp->size > sizeof(uint32_t))
+			lp->values[lp->nvalues++] = value >> 32;
+		return 1;
+	}
+	if (param->loc_reg >= DW_OP_reg0) {
+		lp->size = size;
+		lp->flags = BTF_LOC_PARAM_REG;
+		if (param->loc_deref)
+			lp->flags |= BTF_LOC_PARAM_DEREF;
+		lp->values[lp->nvalues++] = param->loc_reg - DW_OP_reg0;
+		if (param->loc_offset) {
+			lp->flags |= BTF_LOC_PARAM_OFFSET;
+			lp->values[lp->nvalues++] = param->loc_offset;
+		}
+		return 1;
+	}
+	if (param->loc_stack) {
+		lp->size = size;
+		lp->flags = BTF_LOC_PARAM_REG | BTF_LOC_PARAM_DEREF;
+		lp->values[lp->nvalues++] = BTF_LOC_PARAM_FBREG;
+		if (param->loc_offset) {
+			lp->flags |= BTF_LOC_PARAM_OFFSET;
+			lp->values[lp->nvalues++] = param->loc_offset;
+		}
+		return 1;
+	}
+	return 0;
+}
+
+static int btf_encoder__add_inline_expansion(struct btf_encoder *encoder,
+					     struct inline_expansion *ie)
+{
+	struct ftype *ftype;
+	struct loc *loc;
+	struct parameter *param;
+	int err;
+
+	if (!ie->function || !ie->name || ie->section_idx == 0 ||
+	    ie->section_idx >= encoder->seccnt ||
+	    !(encoder->secinfo[ie->section_idx].flags & SHF_EXECINSTR) ||
+	    ie->section_offset > UINT32_MAX)
+		return 0;
+	ftype = &ie->function->proto;
+	loc = calloc(1, sizeof(*loc));
+	if (!loc)
+		return -ENOMEM;
+	loc->name = strdup(ie->name);
+	if (!loc->name) { err = -ENOMEM; goto out; }
+	loc->section_idx = ie->section_idx;
+	loc->section_offset = ie->section_offset;
+	loc->nparams = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
+	loc->params = calloc(loc->nparams ? loc->nparams : 1, sizeof(*loc->params));
+	if (!loc->params) { err = -ENOMEM; goto out; }
+	inline_expansion__for_each_parameter(ie, param) {
+		if (param->idx < loc->nparams)
+			btf_encoder__add_loc_param(param,
+				encoder->secinfo[ie->section_idx].addr,
+				&loc->params[param->idx]);
+	}
+	err = btf_encoder__save_func(encoder, ie->function, NULL, loc);
+	if (!err)
+		return 0;
+	loc = NULL;
+out:
+	loc__delete(loc);
+	return err;
+}
+
+static int btf_encoder__loc_state_cmp(const void *a, const void *b)
+{
+	const struct btf_encoder_func_state *sa = a;
+	const struct btf_encoder_func_state *sb = b;
+	const struct loc *la = sa->loc;
+	const struct loc *lb = sb->loc;
+
+	if (la->section_idx != lb->section_idx)
+		return la->section_idx < lb->section_idx ? -1 : 1;
+	if (la->section_offset != lb->section_offset)
+		return la->section_offset < lb->section_offset ? -1 : 1;
+	return 0;
+}
+
+static int btf_encoder__add_locsec(struct btf_encoder *encoder)
+{
+	struct btf_encoder_func_state *states = encoder->loc_states.array;
+	int err, id;
+
+	if (!encoder->loc_states.cnt)
+		return 0;
+	if (!btf__add_loc_param || !btf__add_loc_param_value || !btf__add_loc_proto ||
+	    !btf__add_loc_proto_param || !btf__add_locsec || !btf__add_locsec_loc)
+		return -ENOTSUP;
+	qsort(states, encoder->loc_states.cnt, sizeof(*states), btf_encoder__loc_state_cmp);
+	for (int i = 0; i < encoder->loc_states.cnt; i++) {
+		struct loc *loc = states[i].loc;
+		int *param_ids = calloc(loc->nparams ? loc->nparams : 1, sizeof(*param_ids));
+		int proto;
+
+		if (!param_ids)
+			return -ENOMEM;
+		proto = btf_encoder__add_func_proto_for_state(encoder, &states[i]);
+		if (proto < 0) { free(param_ids); return proto; }
+		loc->func_id = btf__add_func(encoder->btf, loc->name, BTF_FUNC_STATIC, proto);
+		if (loc->func_id < 0) { free(param_ids); return loc->func_id; }
+		for (uint16_t j = 0; j < loc->nparams; j++) {
+			struct loc_param *p = &loc->params[j];
+
+			/* A zero id in LOC_PROTO represents unavailable location data. */
+			if (!p->size)
+				continue;
+			param_ids[j] = btf__add_loc_param(encoder->btf, p->size, p->flags);
+			if (param_ids[j] < 0) {
+				err = param_ids[j];
+				free(param_ids);
+				return err;
+			}
+			for (uint8_t k = 0; k < p->nvalues; k++) {
+				err = btf__add_loc_param_value(encoder->btf, p->values[k]);
+				if (err < 0) { free(param_ids); return err; }
+			}
+		}
+		loc->loc_proto_id = btf__add_loc_proto(encoder->btf);
+		if (loc->loc_proto_id < 0) { free(param_ids); return loc->loc_proto_id; }
+		for (uint16_t j = 0; j < loc->nparams; j++) {
+			err = btf__add_loc_proto_param(encoder->btf, param_ids[j]);
+			if (err < 0) { free(param_ids); return err; }
+		}
+		free(param_ids);
+	}
+	uint32_t section_idx = UINT32_MAX;
+	for (int i = 0; i < encoder->loc_states.cnt; i++) {
+		struct loc *loc = states[i].loc;
+
+		if (loc->section_idx != section_idx) {
+			section_idx = loc->section_idx;
+			id = btf__add_locsec(encoder->btf, encoder->secinfo[section_idx].name);
+			if (id < 0)
+				return id;
+		}
+		err = btf__add_locsec_loc(encoder->btf, loc->func_id,
+					  loc->loc_proto_id, loc->section_offset);
+		if (err < 0)
+			return err;
+	}
+	btf_encoder__delete_func_states(&encoder->loc_states);
+	return 0;
 }
 
 /*
@@ -3144,6 +3367,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 	struct elf_functions *funcs;
 	uint32_t core_id;
 	struct function *fn;
+	struct inline_expansion *ie;
 	struct tag *pos;
 	int err = 0;
 
@@ -3310,6 +3534,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 		}
 	}
 
+	/* Inline BTF augments, rather than replaces, ordinary function BTF. */
 	cu__for_each_function(cu, core_id, fn) {
 		struct elf_function *func = NULL;
 
@@ -3349,9 +3574,19 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 		if (ftype__has_uncertain_arg_loc(cu, &fn->proto))
 			fn->proto.uncertain_parm_loc = 1;
 
-		err = btf_encoder__save_func(encoder, fn, func);
+		err = btf_encoder__save_func(encoder, fn, func, NULL);
 		if (err)
 			goto out;
+	}
+
+	if (conf_load->btf_gen_inlines) {
+		cu__for_each_inline_expansion(cu, core_id, ie) {
+			if (!ie->name || !ie->function || filter_name(ie->name))
+				continue;
+			err = btf_encoder__add_inline_expansion(encoder, ie);
+			if (err)
+				goto out;
+		}
 	}
 
 	if (encoder->encode_vars)

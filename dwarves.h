@@ -46,6 +46,13 @@ enum load_steal_kind {
 	LSK__ABORT,
 };
 
+/* For older libbpf may need to define BTF loc data. */
+#ifndef BTF_KIND_LOC_PARAM
+#define BTF_KIND_LOC_PARAM	20
+#define BTF_KIND_LOC_PROTO	21
+#define BTF_KIND_LOCSEC		22
+#endif
+
 struct btf_new_opts;
 
 /*
@@ -58,6 +65,13 @@ __weak extern int btf__add_enum64_value(struct btf *btf, const char *name, __u64
 __weak extern int btf__add_type_attr(struct btf *btf, const char *value, int ref_type_id);
 __weak extern int btf__distill_base(const struct btf *src_btf, struct btf **new_base_btf, struct btf **new_split_btf);
 __weak extern struct btf *btf__new_empty_opts(struct btf_new_opts *opts);
+__weak extern int btf__add_loc_param(struct btf *btf, __u32 size, __u32 flags);
+__weak extern int btf__add_loc_param_value(struct btf *btf, __u32 value);
+__weak extern int btf__add_loc_proto(struct btf *btf);
+__weak extern int btf__add_loc_proto_param(struct btf *btf, __u32 id);
+__weak extern int btf__add_locsec(struct btf *btf, const char *name);
+__weak extern int btf__add_locsec_loc(struct btf *btf, __u32 func,
+				      __u32 loc_proto, __u32 offset);
 
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
@@ -104,6 +118,7 @@ struct conf_load {
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
+	bool			btf_gen_inlines;
 	bool			btf_attributes;
 	bool			true_signature;
 	uint8_t			hashtable_bits;
@@ -846,8 +861,10 @@ struct inline_expansion {
 	const char	 *name;
 	size_t		 size;
 	uint64_t	 high_pc;
+	uint64_t	 section_offset;
 	struct list_head parms;
 	struct function	 *function;
+	uint32_t	 section_idx;
 	uint16_t	 nr_parms;
 };
 

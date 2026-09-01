@@ -1701,7 +1701,31 @@ static Dwarf_Die *get_member_with_offset(Dwarf_Die *die, int offset, Dwarf_Die *
 
 static bool dwarf_op__is_reg(unsigned int atom)
 {
-	return atom >= DW_OP_reg0 && atom <= DW_OP_reg31;
+	return (atom >= DW_OP_reg0 && atom <= DW_OP_reg31) || atom == DW_OP_regx;
+}
+
+static int dwarf_op__regno(const Dwarf_Op *op)
+{
+	if (op->atom >= DW_OP_reg0 && op->atom <= DW_OP_reg31)
+		return op->atom - DW_OP_reg0;
+	if (op->atom == DW_OP_regx && op->number <= INT_MAX - DW_OP_reg0)
+		return op->number;
+	return -1;
+}
+
+static int dwarf_op__bregno(const Dwarf_Op *op)
+{
+	if (op->atom >= DW_OP_breg0 && op->atom <= DW_OP_breg31)
+		return op->atom - DW_OP_breg0;
+	if (op->atom == DW_OP_bregx && op->number <= INT_MAX - DW_OP_reg0)
+		return op->number;
+	return -1;
+}
+
+static int64_t dwarf_op__breg_offset(const Dwarf_Op *op)
+{
+	return op->atom == DW_OP_bregx ? (int64_t)(Dwarf_Sword)op->number2 :
+					 (int64_t)(Dwarf_Sword)op->number;
 }
 
 static bool dwarf_expr__has_stack_value(Dwarf_Op *expr, size_t exprlen)
@@ -1720,29 +1744,6 @@ static uint8_t parameter__loc_size(const struct parameter *parm, const struct cu
 	if (size == 0 || size > sizeof(uint64_t))
 		size = sizeof(uint64_t);
 	return size;
-}
-
-static uint8_t dwarf_op__const_size(unsigned int atom)
-{
-	switch (atom) {
-	case DW_OP_lit0 ... DW_OP_lit31:
-	case DW_OP_const1u:
-	case DW_OP_const1s:
-		return 1;
-	case DW_OP_const2u:
-	case DW_OP_const2s:
-		return 2;
-	case DW_OP_const4u:
-	case DW_OP_const4s:
-		return 4;
-	case DW_OP_const8u:
-	case DW_OP_const8s:
-	case DW_OP_constu:
-	case DW_OP_consts:
-		return 8;
-	default:
-		return 0;
-	}
 }
 
 static bool dwarf_op__const_signed(unsigned int atom)
@@ -1781,6 +1782,9 @@ static void parameter__record_loc_reg(struct parameter *parm, int reg,
 				      int64_t offset, bool is_deref,
 				      uint8_t size)
 {
+	if (reg < DW_OP_reg0)
+		return;
+
 	parameter__set_loc_reg(parm, reg);
 
 	if (parm->loc_reg != reg)
@@ -1901,7 +1905,7 @@ static void parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu,
 			else
 				value = dwarf_op__const_value(&expr[0]);
 			parameter__record_loc_const(parm, value,
-						    dwarf_op__const_size(expr[0].atom),
+						    parameter__loc_size(parm, cu),
 						    dwarf_op__const_signed(expr[0].atom), false);
 		}
 		return;
@@ -1913,14 +1917,22 @@ static void parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu,
 
 		switch (expr[0].atom) {
 		case DW_OP_reg0 ... DW_OP_reg31:
-			if (loc_num == 0)
-				parameter__record_loc_reg(parm, expr[0].atom, 0, false, size);
+		case DW_OP_regx: {
+			int reg = dwarf_op__regno(&expr[0]);
+
+			if (loc_num == 0 && reg >= 0)
+				parameter__record_loc_reg(parm, DW_OP_reg0 + reg, 0, false, size);
 			return;
+		}
 		case DW_OP_breg0 ... DW_OP_breg31:
-			if (loc_num == 0 && had_stack_value)
-				parameter__record_loc_reg(parm, expr[0].atom - DW_OP_breg0 + DW_OP_reg0,
-							  dwarf_op__snumber(&expr[0]), false, size);
+		case DW_OP_bregx: {
+			int breg = dwarf_op__bregno(&expr[0]);
+
+			if (loc_num == 0 && had_stack_value && breg >= 0)
+				parameter__record_loc_reg(parm, DW_OP_reg0 + breg,
+							  dwarf_op__breg_offset(&expr[0]), false, size);
 			return;
+		}
 		default:
 			return;
 		}
@@ -1942,10 +1954,14 @@ static void parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu,
 				parameter__set_field_bit(&parm->second_reg_fields, off - cu->addr_size);
 			off += num;
 		} else if (dwarf_op__is_reg(expr[i].atom)) {
+			int reg = dwarf_op__regno(&expr[i]);
+
+			if (reg < 0)
+				continue;
 			if (off < cu->addr_size || parm->loc_reg == PARAMETER_UNKNOWN_REG) {
 				uint8_t size = parameter__loc_size(parm, cu);
 
-				parameter__record_loc_reg(parm, expr[i].atom, 0, false, size);
+				parameter__record_loc_reg(parm, DW_OP_reg0 + reg, 0, false, size);
 			}
 		}
 	}
@@ -1972,10 +1988,56 @@ static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *
 			continue;
 
 		had_stack_value = expr[exprlen - 1].atom == DW_OP_stack_value;
+
+		/*
+		 * These expressions describe a scalar value, not aggregate
+		 * pieces.  Recognize their complete forms before dropping a
+		 * trailing DW_OP_stack_value: doing that first would either lose
+		 * DW_OP_plus_uconst or make a dereference look like a plain reg.
+		 */
+		if (loc_num == 0 && exprlen >= 2) {
+			int breg = dwarf_op__bregno(&expr[0]);
+			int reg = dwarf_op__regno(&expr[0]);
+			int base_reg = breg >= 0 ? breg : reg;
+			int64_t reg_offset = breg >= 0 ? dwarf_op__breg_offset(&expr[0]) : 0;
+
+			if (base_reg >= 0 &&
+			    ((exprlen == 2 &&
+			      (expr[1].atom == DW_OP_deref || expr[1].atom == DW_OP_deref_size)) ||
+			     (exprlen == 3 && had_stack_value &&
+			      (expr[1].atom == DW_OP_deref || expr[1].atom == DW_OP_deref_size)))) {
+				/* DW_OP_deref_size must produce the parameter's full value. */
+				if (expr[1].atom == DW_OP_deref_size &&
+				    expr[1].number != parameter__loc_size(parm, cu))
+					continue;
+				parameter__record_loc_reg(parm, DW_OP_reg0 + base_reg,
+						  reg_offset, true, parameter__loc_size(parm, cu));
+				continue;
+			}
+			if (base_reg >= 0 && exprlen == 3 && had_stack_value &&
+			    expr[1].atom == DW_OP_plus_uconst) {
+				if (expr[1].number > INT64_MAX ||
+				    reg_offset > INT64_MAX - (int64_t)expr[1].number)
+					continue;
+				parameter__record_loc_reg(parm, DW_OP_reg0 + base_reg,
+						  reg_offset + (int64_t)expr[1].number,
+						  false, parameter__loc_size(parm, cu));
+				continue;
+			}
+		}
+
 		if (exprlen == 2 && had_stack_value)
 			exprlen--;
 
 		if (exprlen != 1) {
+			/* Pieces are handled below; other compound expressions are not. */
+			if (exprlen == 2 && (expr[1].atom == DW_OP_deref || expr[1].atom == DW_OP_deref_size)) {
+				/* Do not let parameter__multi_exprs misencode this as a register. */
+				continue;
+			}
+			if (exprlen == 2 && expr[1].atom == DW_OP_plus_uconst)
+				continue;
+
 			parameter__multi_exprs(expr, loc_num, cu, exprlen, parm);
 			continue;
 		}
@@ -1983,14 +2045,22 @@ static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *
 		size = parameter__loc_size(parm, cu);
 		switch (expr->atom) {
 		case DW_OP_reg0 ... DW_OP_reg31:
-			if (loc_num == 0)
-				parameter__record_loc_reg(parm, expr->atom, 0, false, size);
+		case DW_OP_regx: {
+			int reg = dwarf_op__regno(expr);
+
+			if (loc_num == 0 && reg >= 0)
+				parameter__record_loc_reg(parm, DW_OP_reg0 + reg, 0, false, size);
 			break;
+		}
 		case DW_OP_breg0 ... DW_OP_breg31:
-			if (loc_num == 0 && had_stack_value)
-				parameter__record_loc_reg(parm, expr->atom - DW_OP_breg0 + DW_OP_reg0,
-							  dwarf_op__snumber(expr), false, size);
+		case DW_OP_bregx: {
+			int breg = dwarf_op__bregno(expr);
+
+			if (loc_num == 0 && had_stack_value && breg >= 0)
+				parameter__record_loc_reg(parm, DW_OP_reg0 + breg,
+						  dwarf_op__breg_offset(expr), false, size);
 			break;
+		}
 		case DW_OP_fbreg:
 			if (loc_num == 0) {
 				int64_t loc_offset = dwarf_op__snumber(expr);
@@ -2005,24 +2075,54 @@ static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *
 		case DW_OP_lit0 ... DW_OP_lit31:
 			if (loc_num == 0)
 				parameter__record_loc_const(parm, expr->atom - DW_OP_lit0,
-							    dwarf_op__const_size(expr->atom), false, false);
+							    size, false, false);
 			break;
 		case DW_OP_const1u ... DW_OP_consts:
 			if (loc_num == 0)
 				parameter__record_loc_const(parm, dwarf_op__const_value(expr),
-							    dwarf_op__const_size(expr->atom),
+							    size,
 							    dwarf_op__const_signed(expr->atom), false);
 			break;
 		case DW_OP_addr:
 			if (loc_num == 0)
 				parameter__record_loc_const(parm, expr->number, cu->addr_size, false, true);
 			break;
+		case DW_OP_implicit_value: {
+			Dwarf_Block value;
+
+			if (loc_num == 0 && dwarf_getlocation_implicit_value(attr, expr, &value) == 0 &&
+			    value.length > 0 && value.length <= sizeof(uint64_t)) {
+				uint64_t scalar = 0;
+				const uint8_t *bytes = value.data;
+				size_t i;
+
+				for (i = 0; i < value.length; i++) {
+					unsigned int shift = cu->little_endian ? i : value.length - 1 - i;
+
+					scalar |= (uint64_t)bytes[i] << (shift * 8);
+				}
+				parameter__record_loc_const(parm, scalar, value.length, false, false);
+			}
+			break;
+		}
 		case DW_OP_entry_value:
 		case DW_OP_GNU_entry_value:
 			if (dwarf_getlocation_attr(attr, expr, &entry_attr) == 0 &&
-			    dwarf_getlocation(&entry_attr, &entry_ops, &entry_len) == 0 &&
-			    entry_len == 1 && dwarf_op__is_reg(entry_ops->atom))
-				parameter__record_loc_reg(parm, entry_ops->atom, 0, false, size);
+			    dwarf_getlocation(&entry_attr, &entry_ops, &entry_len) == 0) {
+				int entry_breg = entry_len ? dwarf_op__bregno(entry_ops) : -1;
+
+				if (entry_len == 1 && dwarf_op__is_reg(entry_ops->atom)) {
+					int entry_reg = dwarf_op__regno(entry_ops);
+
+					if (entry_reg >= 0)
+						parameter__record_loc_reg(parm, DW_OP_reg0 + entry_reg,
+								  0, false, size);
+				}
+				else if (entry_len == 2 && entry_breg >= 0 &&
+					 entry_ops[1].atom == DW_OP_stack_value)
+					parameter__record_loc_reg(parm, DW_OP_reg0 + entry_breg,
+							  dwarf_op__breg_offset(entry_ops), false, size);
+			}
 			break;
 		}
 	}
@@ -2188,6 +2288,16 @@ static struct inline_expansion *inline_expansion__new(Dwarf_Die *die, struct cu 
 				if (exp->ip.addr == 0)
 					exp->ip.addr = start;
 			}
+		}
+
+		/* DWFL accounts for ET_REL relocations and identifies the actual
+		 * executable section, unlike a raw DWARF address comparison.
+		 */
+		Dwarf_Addr section_addr = exp->ip.addr, bias;
+		Elf_Scn *section = dwfl_module_address_section(cu->dwfl, &section_addr, &bias);
+		if (section != NULL) {
+			exp->section_idx = elf_ndxscn(section);
+			exp->section_offset = section_addr;
 		}
 	}
 out:
