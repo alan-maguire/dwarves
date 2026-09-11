@@ -661,8 +661,7 @@ check_bpftool_btf_support()
 cleanup()
 {
 	if [ -n "$outdir" ] && [ -d "$outdir" ]; then
-		rm ${outdir}/*
-		rmdir $outdir
+		rm -rf "$outdir"
 	fi
 	return 0
 }
