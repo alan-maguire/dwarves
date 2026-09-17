@@ -109,16 +109,32 @@ failed=0
 
 if [ "$use_gcc" -eq 1 ]; then
 	tmpobj=$(make_tmpobj)
-	echo "$src" | $GCC -c -g -x c -o $tmpobj - 2>/dev/null
-	pahole -J $tmpobj 2>/dev/null
-	run_test "$GCC (version $gcc_ver)" "$tmpobj" || failed=1
+	if ! echo "$src" | $GCC -c -g -x c -o "$tmpobj" - >"$outdir/gcc.compile.log" 2>&1; then
+		error_log "FAIL: $GCC could not compile the decl-tag fixture"
+		cat "$outdir/gcc.compile.log" >&2
+		failed=1
+	elif ! pahole -J "$tmpobj" >"$outdir/gcc.pahole.log" 2>&1; then
+		error_log "FAIL: pahole could not encode the GCC decl-tag fixture"
+		cat "$outdir/gcc.pahole.log" >&2
+		failed=1
+	else
+		run_test "$GCC (version $gcc_ver)" "$tmpobj" || failed=1
+	fi
 fi
 
 if [ "$use_clang" -eq 1 ]; then
 	tmpobj=$(make_tmpobj)
-	echo "$src" | $CLANG -c -g -x c -o $tmpobj -
-	pahole -J $tmpobj 2>/dev/null
-	run_test "$CLANG" "$tmpobj" || failed=1
+	if ! echo "$src" | $CLANG -c -g -x c -o "$tmpobj" - >"$outdir/clang.compile.log" 2>&1; then
+		error_log "FAIL: $CLANG could not compile the decl-tag fixture"
+		cat "$outdir/clang.compile.log" >&2
+		failed=1
+	elif ! pahole -J "$tmpobj" >"$outdir/clang.pahole.log" 2>&1; then
+		error_log "FAIL: pahole could not encode the Clang decl-tag fixture"
+		cat "$outdir/clang.pahole.log" >&2
+		failed=1
+	else
+		run_test "$CLANG" "$tmpobj" || failed=1
+	fi
 fi
 
 if [ "$failed" -eq 0 ]; then
