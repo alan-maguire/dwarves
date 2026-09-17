@@ -393,12 +393,13 @@ print_test_result() {
 		;;
 	*)
 		printf ": FAILED!\n"
+		# Always show the test's captured output on failure. Without this,
+		# the normal test summary loses the actual assertion or tool error.
+		echo "     --- Test output ---"
+		sed 's/^/     /' "$tmpdir/$test.out"
+		echo "     --- End of output ---"
 		if [ "${VERBOSE:-0}" = "1" ]; then
-			# Verbose mode: show full test output for complete diagnosis
-			# This includes all commands run, their outputs, and test artifacts
-			echo "     --- Full test output ---"
-			sed 's/^/     /' "$tmpdir/$test.out"
-			echo "     --- End of output ---"
+			# Verbose mode additionally shows referenced logs and test artifacts.
 
 			# Also show contents of any referenced log files
 			# Extract file paths that look like logs (end in .log or are in /tmp)
