@@ -87,10 +87,12 @@ struct btf_encoder_func_state {
 	struct elf_function *elf;
 	struct elf_function_sym *sym;
 	int btf_name_off;
+	int linkage_name_off;
 	uint64_t addr;
 	uint32_t type_id_off;
 	uint16_t nr_parms;
 	uint16_t nr_annots;
+	uint16_t linkage_lang;
 	uint8_t optimized_parms:1;
 	uint8_t unexpected_reg:1;
 	uint8_t inconsistent_proto:1;
@@ -1307,6 +1309,8 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	struct llvm_annotation *annot;
 	struct parameter *param;
 	const char *btf_name;
+	const char *linkage_name;
+	const char *lang;
 	uint8_t param_idx = 0;
 	int str_off, err = 0;
 
@@ -1327,6 +1331,23 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 		goto out;
 	}
 	state->btf_name_off = str_off;
+
+	/*
+	 * Most C functions either don't have a linkage name or have one equal
+	 * to DW_AT_name. Avoid adding a redundant BTF string/tag for them.
+	 */
+	linkage_name = function__linkage_name(fn);
+	lang = lang__int2str(encoder->cu->language);
+	if (linkage_name && strcmp(linkage_name, btf_name) != 0 &&
+	    strcmp(lang, "UNKNOWN") != 0) {
+		str_off = btf__add_str(btf, linkage_name);
+		if (str_off < 0) {
+			err = str_off;
+			goto out;
+		}
+		state->linkage_name_off = str_off;
+		state->linkage_lang = encoder->cu->language;
+	}
 	state->nr_parms = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
 	state->ret_type_id = btf_encoder__tag_type(encoder, ftype->tag.type);
 	if (state->nr_parms > 0) {
@@ -1492,6 +1513,7 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 {
 	int btf_fnproto_id, btf_fn_id, tag_type_id = 0;
 	char tmp_value[KSYM_NAME_LEN];
+	char *linkage_tag = NULL;
 	int16_t component_idx = -1;
 	const char *value;
 	char *name;
@@ -1530,6 +1552,20 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 							btf_fn_id, component_idx);
 		if (tag_type_id < 0)
 			break;
+	}
+	if (tag_type_id >= 0 && state->linkage_name_off) {
+		const char *linkage_name = btf__str_by_offset(encoder->btf, state->linkage_name_off);
+		const char *lang = lang__int2str(state->linkage_lang);
+
+		if (asprintf(&linkage_tag, "%s:linkage:%s", lang, linkage_name) < 0) {
+			fprintf(stderr, "error: failed to allocate linkage tag for func %s\n", name);
+			free(name);
+			return -ENOMEM;
+		}
+		tag_type_id = btf_encoder__add_decl_tag(encoder, linkage_tag, btf_fn_id, -1);
+		free(linkage_tag);
+		if (tag_type_id < 0)
+			value = "linkage";
 	}
 	if (tag_type_id < 0) {
 		fprintf(stderr,
