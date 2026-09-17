@@ -2159,7 +2159,9 @@ static struct function *function__new(Dwarf_Die *die, struct cu *cu, struct conf
 		ftype__init(&func->proto, die, cu);
 		lexblock__init(&func->lexblock, cu, die);
 		func->name	      = attr_string(die, DW_AT_name, conf);
-		func->linkage_name    = attr_string(die, DW_AT_MIPS_linkage_name, conf);
+		func->linkage_name    = attr_string(die, DW_AT_linkage_name, conf);
+		if (!func->linkage_name)
+			func->linkage_name    = attr_string(die, DW_AT_MIPS_linkage_name, conf);
 		func->inlined	      = attr_numeric(die, DW_AT_inline);
 		func->declaration     = dwarf_hasattr(die, DW_AT_declaration);
 		func->external	      = dwarf_hasattr(die, DW_AT_external);
