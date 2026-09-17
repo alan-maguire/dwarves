@@ -3651,6 +3651,25 @@ static int parameter__abi_slots(const struct parameter *parm, const struct cu *c
 	return slots > 0 ? slots : 1;
 }
 
+/*
+ * Floating point and vector arguments are allocated from a register bank of
+ * their own -- v0-v7 on arm64, xmm0-xmm7 on x86-64 -- so a wide one does not
+ * take a general purpose register pair and must not trigger the even-register
+ * alignment rule, which applies to the general purpose bank only.
+ */
+static bool tag__uses_gpr_bank(const struct tag *type, const struct cu *cu)
+{
+	/* Scalars represented by FP/SIMD registers have their own allocation bank. */
+	if (tag__is_base_type(type, cu) && base_type__is_float(tag__base_type(type)))
+		return false;
+
+	/* Also exclude vector/SIMD types if dwarves represents them distinctly. */
+	if (tag__is_vector(type))
+		return false;
+
+	return true;
+}
+
 static int parameter__abi_reg_align(const struct parameter *parm, const struct cu *cu)
 {
 	struct tag *type;
@@ -3659,7 +3678,7 @@ static int parameter__abi_reg_align(const struct parameter *parm, const struct c
 		return 1;
 
 	type = tag__strip_typedefs_and_modifiers(&parm->tag, cu);
-	if (type == NULL)
+	if (type == NULL || !tag__uses_gpr_bank(type, cu))
 		return 1;
 
 	return tag__natural_alignment(type, cu) > cu->addr_size ? 2 : 1;
