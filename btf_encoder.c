@@ -86,6 +86,7 @@ struct elf_function_sym {
 struct btf_encoder_func_state {
 	struct elf_function *elf;
 	struct elf_function_sym *sym;
+	int btf_name_off;
 	uint64_t addr;
 	uint32_t type_id_off;
 	uint16_t nr_parms;
@@ -1305,6 +1306,7 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 	struct btf *btf = encoder->btf;
 	struct llvm_annotation *annot;
 	struct parameter *param;
+	const char *btf_name;
 	uint8_t param_idx = 0;
 	int str_off, err = 0;
 
@@ -1313,6 +1315,18 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 
 	state->addr = function__addr(fn);
 	state->elf = func;
+	/*
+	 * The ELF function name is the linkage name and is used only to
+	 * associate DWARF with its symbol.  Keep DW_AT_name for the BTF
+	 * function name so consumers can use Rust's source-level name.
+	 */
+	btf_name = function__name(fn) ?: func->name;
+	str_off = btf__add_str(btf, btf_name);
+	if (str_off < 0) {
+		err = str_off;
+		goto out;
+	}
+	state->btf_name_off = str_off;
 	state->nr_parms = ftype->nr_parms + (ftype->unspec_parms ? 1 : 0);
 	state->ret_type_id = btf_encoder__tag_type(encoder, ftype->tag.type);
 	if (state->nr_parms > 0) {
@@ -1477,17 +1491,20 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 				     struct btf_encoder_func_state *state)
 {
 	int btf_fnproto_id, btf_fn_id, tag_type_id = 0;
-	struct elf_function *func = state->elf;
 	char tmp_value[KSYM_NAME_LEN];
 	int16_t component_idx = -1;
 	const char *value;
-	const char *name;
+	char *name;
 	uint16_t idx;
 
 	btf_fnproto_id = btf_encoder__add_func_proto_for_state(encoder, state);
-	name = func->name;
-	if (encoder->true_signature && state->sym)
-		name = state->sym->name;
+	/*
+	 * btf_encoder__add_ref_type() adds this name to the BTF string set and
+	 * may reallocate it. Do not pass it a pointer into that same string set.
+	 */
+	name = strdup(btf__str_by_offset(encoder->btf, state->btf_name_off));
+	if (!name)
+		return -ENOMEM;
 
 	if (btf_fnproto_id >= 0)
 		btf_fn_id = btf_encoder__add_ref_type(encoder, BTF_KIND_FUNC, btf_fnproto_id,
@@ -1495,6 +1512,7 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 	if (btf_fnproto_id < 0 || btf_fn_id < 0) {
 		printf("error: failed to encode function '%s': invalid %s\n",
 		       name, btf_fnproto_id < 0 ? "proto" : "func");
+		free(name);
 		return -1;
 	}
 
@@ -1517,9 +1535,11 @@ static int32_t btf_encoder__add_func(struct btf_encoder *encoder,
 		fprintf(stderr,
 			"error: failed to encode tag '%s' to func %s with component_idx %d\n",
 			value, name, component_idx);
+		free(name);
 		return -1;
 	}
 
+	free(name);
 	return btf_fn_id;
 }
 
@@ -3329,7 +3349,7 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 		if (funcs->cnt) {
 			const char *name;
 
-			name = function__name(fn);
+			name = function__linkage_name(fn) ?: function__name(fn);
 			if (!name)
 				continue;
 
