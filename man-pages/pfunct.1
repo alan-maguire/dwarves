@@ -113,6 +113,22 @@ Not declared inline, inlined by compiler (DWARF only).
 Show inline expansion stats (DWARF only).
 
 .TP
+.B \-j, \-\-inline_sites
+Show BTF inline sites encoded in LOCSEC records. If no
+.B --format_path
+is specified, this option automatically selects BTF input.
+
+Each site includes its address, section-relative offset, inlined function
+prototype, and parameter locations. For BTF embedded in an ELF file, the
+address is resolved using the ELF section virtual address. For raw or detached
+BTF, the section-relative offset is printed as the address. Parameter locations
+are shown as registers, dereferenced registers, constants, addresses, or
+.B unavailable
+when location information is absent. Use
+.B -f
+to show sites for only one inlined function.
+
+.TP
 .B \-l, \-\-decl_info
 Show source code info.
 
