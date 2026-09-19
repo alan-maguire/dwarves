@@ -108,6 +108,26 @@ if ! pfunct --all --format_path=btf "$btf" 2>/dev/null | grep -Fq "inline int co
 	test_fail
 fi
 
+# Inline sites must be printable directly from detached BTF: --inline_sites
+# selects BTF automatically and uses the LOCSEC-relative address in this case.
+if ! inline_sites=$(pfunct --inline_sites "$btf" 2>/dev/null); then
+	error_log "pfunct could not dump inline sites from BTF"
+	test_fail
+fi
+scale_sites=$(grep -E '^0x[0-9a-f]+ \[\.text +\+0x[0-9a-f]+\] scale\(' <<<"$inline_sites")
+if ! grep -Eq 'scale\(.*\[[^]]+\]' <<<"$scale_sites"; then
+	error_log "pfunct did not render the scale() inline site and its locations"
+	test_fail
+fi
+
+# -f applies to inline-site output without discarding the BTF CU during load.
+if ! inline_scale_sites=$(pfunct --inline_sites -f scale "$btf" 2>/dev/null) ||
+	   ! grep -Fq 'scale(' <<<"$inline_scale_sites" ||
+	   grep -Eq 'add_bias\(|combine\(' <<<"$inline_scale_sites"; then
+	error_log "pfunct did not filter inline sites by function name"
+	test_fail
+fi
+
 if command -v bpftool >/dev/null 2>&1; then
 	locsec_vlen=$(bpftool btf dump file "$btf" format raw 2>/dev/null |
 		     sed -n 's/.*LOCSEC .*vlen=\([0-9][0-9]*\).*/\1/p')
