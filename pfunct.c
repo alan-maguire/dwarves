@@ -39,8 +39,17 @@ static uint64_t addr;
 static char *class_name;
 static char *function_name;
 static const char *base_btf_file;
+static bool show_inline_sites;
 
 static struct conf_fprintf conf;
+
+#define BTF_LOC_PARAM_SIGNED	0x1
+#define BTF_LOC_PARAM_CONST	0x2
+#define BTF_LOC_PARAM_ADDR	0x4
+#define BTF_LOC_PARAM_REG	0x8
+#define BTF_LOC_PARAM_DEREF	0x10
+#define BTF_LOC_PARAM_OFFSET	0x20
+#define BTF_LOC_PARAM_FBREG	0xffffffffU
 
 static struct conf_load conf_load = {
 	.conf_fprintf = &conf,
@@ -429,6 +438,122 @@ static int cu_function_iterator(struct cu *cu, void *cookie __maybe_unused)
 	return 0;
 }
 
+static const char *btf_reg_name(uint32_t reg, char *buf, size_t len)
+{
+	static const char * const x86_64[] = {
+		"rax", "rdx", "rcx", "rbx", "rsi", "rdi", "rbp", "rsp",
+		"r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+	};
+
+	if (reg == BTF_LOC_PARAM_FBREG)
+		return "fbreg";
+	if (reg < ARRAY_SIZE(x86_64))
+		return x86_64[reg];
+	snprintf(buf, len, "reg%u", reg);
+	return buf;
+}
+
+static bool btf_inline_site__fprintf_loc(const struct btf_type *type,
+					 const struct btf_inline_site *site, FILE *fp)
+{
+	const uint32_t *values = (const uint32_t *)(type + 1);
+	uint32_t flags = *values++;
+	uint64_t value;
+	char regbuf[16];
+	const char *reg;
+
+	if (flags & BTF_LOC_PARAM_CONST) {
+		value = values[0];
+		if (type->size > sizeof(values[0]))
+			value |= (uint64_t)values[1] << 32;
+		if (flags & BTF_LOC_PARAM_ADDR) {
+			fputs("addr ", fp);
+			if (site->section_addr)
+				fprintf(fp, "%#llx", (unsigned long long)(site->section_addr + value));
+			else
+				fprintf(fp, "%s+%#llx", site->section_name,
+					(unsigned long long)value);
+			return true;
+		}
+		fputs("const ", fp);
+		if (flags & BTF_LOC_PARAM_SIGNED)
+			fprintf(fp, "%lld", (long long)value);
+		else
+			fprintf(fp, "%#llx", (unsigned long long)value);
+		return true;
+	}
+	if (!(flags & BTF_LOC_PARAM_REG))
+		return false;
+	reg = btf_reg_name(values[0], regbuf, sizeof(regbuf));
+	if (flags & BTF_LOC_PARAM_DEREF)
+		fprintf(fp, "*(%%%s", reg);
+	else
+		fprintf(fp, "%%%s", reg);
+	if (flags & BTF_LOC_PARAM_OFFSET)
+		fprintf(fp, "%+d", (int32_t)values[1]);
+	if (flags & BTF_LOC_PARAM_DEREF)
+		fputc(')', fp);
+	return true;
+}
+
+static void btf_inline_site__fprintf(const struct btf_inline_site *site,
+				     const struct cu *cu, FILE *fp)
+{
+	const struct btf_type *proto;
+	const uint32_t *param_ids;
+	struct ftype *ftype;
+	struct parameter *param;
+	uint16_t i = 0;
+
+	if (!site->function)
+		return;
+	proto = btf__type_by_id(cu->priv, site->loc_proto);
+	ftype = tag__ftype(cu__type(cu, site->function->proto.tag.type));
+	if (!proto || btf_kind(proto) != BTF_KIND_LOC_PROTO || !ftype)
+		return;
+	param_ids = (const uint32_t *)(proto + 1);
+	/* Raw or detached BTF has no ELF section VMA; its LOCSEC offset is
+	 * still useful and is the best address available in that case.
+	 */
+	fprintf(fp, "%#llx [%s +%#x] %s(",
+		(unsigned long long)(site->section_addr ?
+			 site->section_addr + site->section_offset : site->section_offset),
+		site->section_name, site->section_offset, function__name(site->function));
+	ftype__for_each_parameter(ftype, param) {
+		struct tag *type = cu__type(cu, param->tag.type);
+		const struct btf_type *location = NULL;
+		char typebuf[128];
+
+		if (i)
+			fputs(", ", fp);
+		fputs(tag__name(type, cu, typebuf, sizeof(typebuf), &conf), fp);
+		if (!conf.no_parm_names && parameter__name(param))
+			fprintf(fp, " %s", parameter__name(param));
+		if (i < btf_vlen(proto))
+			location = btf__type_by_id(cu->priv, param_ids[i]);
+		fputs(" [", fp);
+		if (!location || btf_kind(location) != BTF_KIND_LOC_PARAM ||
+		    !btf_inline_site__fprintf_loc(location, site, fp))
+			fputs("unavailable", fp);
+		fputc(']', fp);
+		++i;
+	}
+	if (i == 0)
+		fputs("void", fp);
+	fputs(")\n", fp);
+}
+
+static int cu_btf_inline_sites_iterator(struct cu *cu, void *cookie __maybe_unused)
+{
+	struct btf_inline_site *site;
+
+	list_for_each_entry(site, &cu->btf_inline_sites, node)
+		if (!function_name ||
+		    strcmp(function__name(site->function), function_name) == 0)
+			btf_inline_site__fprintf(site, cu, stdout);
+	return 0;
+}
+
 static int elf_symtab__show(char *filename)
 {
 	int fd = open(filename, O_RDONLY), err = -1;
@@ -616,6 +741,11 @@ static const struct argp_option pfunct__options[] = {
 		.doc  = "show inline expansions",
 	},
 	{
+		.key  = 'j',
+		.name = "inline_sites",
+		.doc  = "show BTF inline sites and parameter locations (ELF BTF only)",
+	},
+	{
 		.key  = 'I',
 		.name = "inline_expansions_stats",
 		.doc  = "show inline expansions stats",
@@ -725,6 +855,10 @@ static error_t pfunct__options_parser(int key, char *arg,
 	case 'i': show_inline_expansions = verbose = 1;
 		  conf_load.extra_dbg_info = true;
 		  conf_load.get_addr_info = true;	 break;
+	case 'j': show_inline_sites = true;
+		  if (conf_load.format_path == NULL)
+			  conf_load.format_path = "btf";
+		  break;
 	case 'I': formatter = fn_stats_inline_exps_fmtr;
 		  conf_load.get_addr_info = true;	 break;
 	case 'l': conf.show_decl_info = 1;
@@ -820,7 +954,8 @@ int main(int argc, char *argv[])
 		goto out_dwarves_exit;
 	}
 
-	if (function_name || (!function_name && show_all_matches) || class_name)
+	if ((function_name && !show_inline_sites) ||
+	    (!function_name && show_all_matches) || class_name)
 		conf_load.steal = pfunct_stealer;
 
 try_sole_arg_as_function_name:
@@ -857,6 +992,8 @@ try_sole_arg_as_function_name:
 		function__show(f, cu);
 	} else if (show_total_inline_expansion_stats)
 		print_total_inline_stats();
+	else if (show_inline_sites)
+		cus__for_each_cu(cus, cu_btf_inline_sites_iterator, NULL, NULL);
 	else if (expand_types)
 		cus__for_each_cu(cus, cu_function_iterator, NULL, NULL);
 	else if (function_name == NULL)
