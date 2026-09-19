@@ -25,8 +25,6 @@
 #include <bpf/libbpf.h>
 #include <zlib.h>
 
-#include <gelf.h>
-
 #include "dutil.h"
 #include "dwarves.h"
 
@@ -35,6 +33,28 @@ struct btf_locsec_entry {
 	uint32_t loc_proto;
 	uint32_t offset;
 };
+
+static void btf__add_inline_site(struct cu *cu, const char *section_name,
+				 const struct btf_locsec_entry *entry)
+{
+	struct tag *tag = cu__function(cu, entry->func);
+	struct btf_inline_site *site;
+
+	if (!tag || !section_name)
+		return;
+	site = zalloc(sizeof(*site));
+	if (!site)
+		return;
+	site->section_name = strdup(section_name);
+	if (!site->section_name) {
+		free(site);
+		return;
+	}
+	site->function = tag__function(tag);
+	site->section_offset = entry->offset;
+	site->loc_proto = entry->loc_proto;
+	list_add_tail(&site->node, &cu->btf_inline_sites);
+}
 
 static const char *cu__btf_str(struct cu *cu, uint32_t offset)
 {
@@ -647,6 +667,12 @@ static int btf__load_types(struct btf *btf, struct cu *cu)
 			 * loaded.
 			 */
 			break;
+		case BTF_KIND_LOC_PARAM:
+		case BTF_KIND_LOC_PROTO:
+		case BTF_KIND_LOCSEC:
+			/* LOCSEC is decoded after the ordinary BTF types are loaded. */
+			err = 0;
+			break;
 		default:
 			fprintf(stderr, "BTF: idx: %d, Unknown kind %d\n", type_index, type);
 			fflush(stderr);
@@ -694,7 +720,7 @@ static void btf__mark_inline_functions(struct btf *btf, struct cu *cu)
 	for (type_index = 1; type_index < btf__type_cnt(btf); type_index++) {
 		const struct btf_locsec_entry *entries;
 		const char *name;
-		uint16_t i;
+		uint32_t i, nr_entries;
 
 		type_ptr = btf__type_by_id(btf, type_index);
 		type = btf_kind(type_ptr);
@@ -706,12 +732,18 @@ static void btf__mark_inline_functions(struct btf *btf, struct cu *cu)
 		if (!name || !strstarts(name, "inline"))
 			continue;
 
+		/* LOCSEC uses the extended 24-bit vlen introduced with the
+		 * location BTF kinds.  Older libbpf headers still expose the
+		 * original 16-bit btf_vlen() helper.
+		 */
+		nr_entries = type_ptr->info & 0x00ffffff;
 		entries = (const struct btf_locsec_entry *)(type_ptr + 1);
-		for (i = 0; i < btf_vlen(type_ptr); i++) {
+		for (i = 0; i < nr_entries; i++) {
 			struct tag *tag = cu__function(cu, entries[i].func);
 
 			if (tag)
 				tag__function(tag)->inlined = DW_INL_declared_inlined;
+			btf__add_inline_site(cu, name + strlen("inline"), &entries[i]);
 		}
 	}
 }
@@ -851,6 +883,13 @@ static int cu__fixup_btf_bitfields(const struct conf_load *conf, struct cu *cu)
 
 static void btf__cu_delete(struct cu *cu)
 {
+	struct btf_inline_site *site, *n;
+
+	list_for_each_entry_safe(site, n, &cu->btf_inline_sites, node) {
+		list_del(&site->node);
+		free(site->section_name);
+		free(site);
+	}
 	btf__free(cu->priv);
 	cu->priv = NULL;
 }
