@@ -292,12 +292,23 @@ struct debug_fmt_ops {
 	bool		   has_alignment_info;
 };
 
+/* A BTF LOCSEC record describing one inline expansion. */
+struct function;
+struct btf_inline_site {
+	struct list_head node;
+	struct function *function;
+	char		 *section_name;
+	uint32_t	 section_offset;
+	uint32_t	 loc_proto;
+};
+
 #define ARCH_MAX_REGISTER_PARAMS	8
 
 struct cu {
 	struct list_head node;
 	struct list_head tags;
 	struct list_head tool_list;	/* To be used by tools such as ctracer */
+	struct list_head btf_inline_sites;
 	struct ptr_table types_table;
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
