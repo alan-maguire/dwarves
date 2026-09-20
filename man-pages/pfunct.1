@@ -1,6 +1,6 @@
 .\" Man page for pfunct
 .\" Licensed under version 2 of the GNU General Public License.
-.TH pfunct 1 "September 2, 2026" "dwarves" "dwarves"
+.TH pfunct 1 "September 20, 2026" "dwarves" "dwarves"
 .\"
 .SH NAME
 pfunct \- Shows function information in debug information.
@@ -82,7 +82,9 @@ Show just external functions (DWARF only).
 
 .TP
 .B \-f,\-\-function=FUNCTION
-Show just FUNCTION.
+Show just FUNCTION. When used with
+.B \-j,\-\-inline_sites,
+show only sites for the specified inlined function.
 
 .TP
 .B \-F, \-\-format_path
@@ -95,6 +97,16 @@ includes "btf", "ctf" and "dwarf". The default format path used is equivalent to
 Use PATH as the base BTF when loading split BTF. If no format path is given,
 this selects BTF loading. This option is not needed for kernel module BTF read
 from /sys/kernel/btf/MODULE, where the vmlinux BTF is selected automatically.
+
+.TP
+.B \-\-running[=OBJECT]
+Resolve BTF inline-site addresses against the running kernel instead of an ELF
+companion. OBJECT is vmlinux by default, or the name of a loaded module.
+For vmlinux, only .text inline sites are shown, using _stext from
+/proc/kallsyms. For a module, section bases are read from
+/sys/module/OBJECT/sections. Address visibility is subject to normal kernel
+permissions, including kptr_restrict. When symbol addresses are visible,
+pfunct also uses /proc/kallsyms to identify the containing function.
 
 .TP
 .B \-g,\-\-goto_labels
@@ -111,6 +123,34 @@ Not declared inline, inlined by compiler (DWARF only).
 .TP
 .B \-i, \-\-inline_expansions
 Show inline expansion stats (DWARF only).
+
+.TP
+.B \-j, \-\-inline_sites
+Show BTF inline sites encoded in LOCSEC records. If no
+.B \-\-format_path
+is specified, this option automatically selects BTF input.
+
+Each site includes its address, section-relative offset, inlined function
+prototype, and parameter locations. Parameter locations are shown as
+registers, dereferenced registers, constants, addresses, or
+.B unavailable
+when location information is absent. Without ELF information, registers use
+the generic
+.B regN
+notation and addresses are section-relative. When the input is an ELF file
+with embedded BTF, its ELF information is used automatically. For raw or
+detached BTF, use
+.B \-\-elf
+to resolve absolute addresses, enclosing ELF functions, and
+architecture-specific register names.
+
+.TP
+.B \-\-elf=PATH
+Use PATH as the ELF companion for
+.B \-j,\-\-inline_sites.
+Its section addresses, symbol table, and register names are used to resolve
+detached or raw BTF inline sites to absolute addresses, their containing
+functions, and architecture-specific register names.
 
 .TP
 .B \-l, \-\-decl_info
@@ -201,6 +241,36 @@ Show all functions in detached split BTF using its vmlinux base:
 .PP
 .nf
 $ pfunct --btf_base=vmlinux.btf --all module.btf
+\&...
+.fi
+
+.P
+Show inline BTF sites from a detached BTF file, resolving each site to the
+containing function in its ELF companion:
+.PP
+.nf
+$ pfunct --inline_sites --elf ./program ./program.btf
+0x401120 [wrapper+0x0, .text +0x100] add_one(int value [%rdi])
+\&...
+.fi
+
+.P
+For an ELF file with embedded BTF, the ELF companion is inferred from the
+input, so no separate
+.B \-\-elf
+option is needed:
+.PP
+.nf
+$ pfunct --inline_sites ./program
+0x401120 [wrapper+0x0, .text +0x100] add_one(int value [%rdi])
+\&...
+.fi
+
+.P
+Limit inline-site output to the inlined function named add_one:
+.PP
+.nf
+$ pfunct --inline_sites --elf ./program -f add_one ./program.btf
 \&...
 .fi
 
