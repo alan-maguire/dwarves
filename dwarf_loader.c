@@ -1501,6 +1501,23 @@ static bool arch__agg_use_two_regs(const GElf_Ehdr *ehdr)
 	}
 }
 
+/*
+ * Some ABIs require an argument whose alignment is twice the register size to
+ * start on an even-numbered argument register, leaving a hole when the next
+ * free register is an odd one. For example, on arm64,
+ *	u64 f(u64 a, __int128 v, u64 b)
+ * passes a in x0, v in x2:x3 -- skipping x1 -- and b in x4.
+ */
+static bool arch__arg_align_two_regs(const GElf_Ehdr *ehdr)
+{
+	switch (ehdr->e_machine) {
+	case EM_AARCH64:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static struct template_type_param *template_type_param__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct template_type_param *ttparm = tag__alloc(cu, sizeof(*ttparm));
@@ -3634,6 +3651,47 @@ static int parameter__abi_slots(const struct parameter *parm, const struct cu *c
 	return slots > 0 ? slots : 1;
 }
 
+/*
+ * Floating point and vector arguments are allocated from a register bank of
+ * their own -- v0-v7 on arm64, xmm0-xmm7 on x86-64 -- so a wide one does not
+ * take a general purpose register pair and must not trigger the even-register
+ * alignment rule, which applies to the general purpose bank only.
+ */
+static bool tag__uses_gpr_bank(const struct tag *type, const struct cu *cu)
+{
+	/* Scalars represented by FP/SIMD registers have their own allocation bank. */
+	if (tag__is_base_type(type, cu) && base_type__is_float(tag__base_type(type)))
+		return false;
+
+	/* Also exclude vector/SIMD types if dwarves represents them distinctly. */
+	if (tag__is_vector(type))
+		return false;
+
+	return true;
+}
+
+static int parameter__abi_reg_align(const struct parameter *parm, const struct cu *cu)
+{
+	struct tag *type;
+
+	if (!cu->arg_align_two_regs || parm->type_byte_size <= cu->addr_size)
+		return 1;
+
+	type = tag__strip_typedefs_and_modifiers(&parm->tag, cu);
+	if (type == NULL || !tag__uses_gpr_bank(type, cu))
+		return 1;
+
+	return tag__natural_alignment(type, cu) > cu->addr_size ? 2 : 1;
+}
+
+static int parameter__align_reg_idx(const struct parameter *parm, int reg_idx,
+				    const struct cu *cu)
+{
+	int align = parameter__abi_reg_align(parm, cu);
+
+	return (reg_idx + align - 1) & ~(align - 1);
+}
+
 static bool parameter__has_piece_info(const struct parameter *parm)
 {
 	return parm->first_reg_fields || parm->second_reg_fields;
@@ -3653,7 +3711,7 @@ static bool ftype__next_parameter_preserves_slots(struct ftype *ftype, struct pa
 	if (!next || next->loc_reg == PARAMETER_UNKNOWN_REG)
 		return false;
 
-	next_reg_idx = reg_idx + slots;
+	next_reg_idx = parameter__align_reg_idx(next, reg_idx + slots, cu);
 	return next_reg_idx < cu->nr_register_params &&
 	       next->loc_reg == cu->register_params[next_reg_idx];
 }
@@ -3702,6 +3760,7 @@ static void function__match_clang_parameter_locations(struct ftype *ftype, struc
 		if (pos->passed_in_memory)
 			continue;
 
+		reg_idx = parameter__align_reg_idx(pos, reg_idx, cu);
 		if (reg_idx >= cu->nr_register_params)
 			break;
 
@@ -3732,10 +3791,16 @@ static void function__analyze_parameter_locations(struct function *fn, struct cu
 
 	ftype__for_each_parameter(ftype, pos) {
 		bool consumes_register = true;
-		bool regs_available = reg_idx < cu->nr_register_params;
+		bool regs_available;
 		int slots = parameter__abi_slots(pos, cu);
-		int expected_reg = regs_available ? cu->register_params[reg_idx] : -1;
+		int expected_reg;
 		int reg_slots = pos->passed_in_memory ? 1 : slots;
+
+		if (!pos->passed_in_memory)
+			reg_idx = parameter__align_reg_idx(pos, reg_idx, cu);
+
+		regs_available = reg_idx < cu->nr_register_params;
+		expected_reg = regs_available ? cu->register_params[reg_idx] : -1;
 
 		if (pos->has_loc) {
 			if (true_sig_enabled && pos->loc_const_value) {
@@ -4467,6 +4532,7 @@ static int cu__set_common(struct cu *cu, struct conf_load *conf,
 	cu->little_endian = ehdr.e_ident[EI_DATA] == ELFDATA2LSB;
 	cu->nr_register_params = arch__nr_register_params(&ehdr);
 	cu->agg_use_two_regs = arch__agg_use_two_regs(&ehdr);
+	cu->arg_align_two_regs = arch__arg_align_two_regs(&ehdr);
 	arch__set_register_params(&ehdr, cu);
 	return 0;
 }

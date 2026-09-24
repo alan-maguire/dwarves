@@ -304,6 +304,7 @@ struct cu {
 	uint8_t		 little_endian:1;
 	uint8_t		 producer_clang:1;
 	uint8_t		 agg_use_two_regs:1;	/* An aggregate like {long a; long b;} */
+	uint8_t		 arg_align_two_regs:1;	/* An over-aligned arg starts on an even register */
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
@@ -1606,6 +1607,11 @@ static inline uint16_t base_type__size(const struct tag *tag)
 	return tag__base_type(tag)->bit_size / 8;
 }
 
+static inline bool base_type__is_float(const struct base_type *bt)
+{
+	return bt->float_type != 0;
+}
+
 const char *__base_type__name(const struct base_type *bt);
 
 const char *base_type__name(const struct base_type *btype, char *bf, size_t len);
@@ -1622,6 +1628,11 @@ struct array_type {
 static inline struct array_type *tag__array_type(const struct tag *tag)
 {
 	return (struct array_type *)tag;
+}
+
+static inline bool tag__is_vector(const struct tag *tag)
+{
+	return tag->tag == DW_TAG_array_type && tag__array_type(tag)->is_vector;
 }
 
 struct string_type {
