@@ -32,6 +32,8 @@ fi
 cat > ${align16}.c << EOF
 typedef unsigned long long u64;
 struct box { __int128 v; };
+struct __attribute__((aligned(16))) aligned_box { u64 v; };
+struct __attribute__((packed, aligned(1))) packed_box { __int128 v; };
 
 __attribute__((noinline)) u64 f_even(u64 a, u64 b, __int128 v)
 { return a + b + (u64)v; }
@@ -49,8 +51,16 @@ __attribute__((noinline)) u64 f_stack(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f,
 __attribute__((noinline)) u64 f_box(u64 a, struct box s, u64 b)
 { return a + b + (u64)s.v; }
 
+/* DW_AT_alignment, rather than member-derived alignment, decides this. */
+__attribute__((noinline)) u64 f_aligned(u64 a, struct aligned_box s, u64 b)
+{ return a + b + s.v; }
+
+__attribute__((noinline)) u64 f_packed(u64 a, struct packed_box s, u64 b)
+{ return a + b + (u64)s.v; }
+
 u64 (*keep[])() = { (u64(*)())f_even, (u64(*)())f_odd, (u64(*)())f_odd_tail,
-		    (u64(*)())f_stack, (u64(*)())f_box };
+			    (u64(*)())f_stack, (u64(*)())f_box, (u64(*)())f_aligned,
+			    (u64(*)())f_packed };
 EOF
 
 ${CC} -g -O2 -c -o ${align16}.o ${align16}.c 2>/dev/null
@@ -65,7 +75,7 @@ if [[ $? -ne 0 ]]; then
 	test_fail
 fi
 
-for fn in f_even f_odd f_odd_tail f_stack f_box; do
+for fn in f_even f_odd f_odd_tail f_stack f_box f_aligned f_packed; do
 	encoded=$(pfunct --all --format_path=btf ${align16}.o | grep " ${fn}(")
 	verbose_log "BTF: $encoded"
 	if [[ -z "$encoded" ]]; then
