@@ -3670,6 +3670,25 @@ static bool tag__uses_gpr_bank(const struct tag *type, const struct cu *cu)
 	return true;
 }
 
+/*
+ * DW_AT_alignment describes the effective alignment selected by the
+ * compiler. Use it when available: it covers explicitly over-aligned types,
+ * and must also override member-derived alignment for packed or under-aligned
+ * types. Older DWARF commonly omits the attribute, so retain the
+ * natural-alignment fallback.
+ */
+static size_t parameter__abi_alignment(struct tag *type, const struct cu *cu)
+{
+	if (tag__is_struct(type) || tag__is_union(type)) {
+		uint16_t alignment = tag__type(type)->alignment;
+
+		if (alignment)
+			return alignment;
+	}
+
+	return tag__natural_alignment(type, cu);
+}
+
 static int parameter__abi_reg_align(const struct parameter *parm, const struct cu *cu)
 {
 	struct tag *type;
@@ -3681,7 +3700,7 @@ static int parameter__abi_reg_align(const struct parameter *parm, const struct c
 	if (type == NULL || !tag__uses_gpr_bank(type, cu))
 		return 1;
 
-	return tag__natural_alignment(type, cu) > cu->addr_size ? 2 : 1;
+	return parameter__abi_alignment(type, cu) > cu->addr_size ? 2 : 1;
 }
 
 static int parameter__align_reg_idx(const struct parameter *parm, int reg_idx,
