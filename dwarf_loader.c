@@ -1518,6 +1518,22 @@ static bool arch__arg_align_two_regs(const GElf_Ehdr *ehdr)
 	}
 }
 
+/*
+ * Architectures whose argument register mapping has been validated for
+ * matching clang parameter locations and reconstructing true signatures.
+ * Other architectures keep only the basic optimized-out detection.
+ */
+static bool arch__param_loc_supported(const GElf_Ehdr *ehdr)
+{
+	switch (ehdr->e_machine) {
+	case EM_X86_64:
+	case EM_AARCH64:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static struct template_type_param *template_type_param__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf)
 {
 	struct template_type_param *ttparm = tag__alloc(cu, sizeof(*ttparm));
@@ -4070,7 +4086,8 @@ static void function__analyze_parameter_locations(struct function *fn, struct cu
 {
 	struct ftype *ftype = &fn->proto;
 	struct parameter *pos;
-	bool true_sig_enabled = conf->true_signature && ftype->signature_changed;
+	bool true_sig_enabled = cu->param_loc_supported && conf->true_signature &&
+				ftype->signature_changed;
 	bool check_locations = !cu->producer_clang || ftype->signature_changed;
 	int reg_idx = 0;
 
@@ -4078,7 +4095,8 @@ static void function__analyze_parameter_locations(struct function *fn, struct cu
 		/* Producer is clang and the signature was not changed: match
 		 * each parameter against its expected ABI argument register.
 		 */
-		function__match_clang_parameter_locations(ftype, cu);
+		if (cu->param_loc_supported)
+			function__match_clang_parameter_locations(ftype, cu);
 		return;
 	}
 
@@ -4786,6 +4804,7 @@ static int cu__set_common(struct cu *cu, struct conf_load *conf,
 	cu->nr_register_params = arch__nr_register_params(&ehdr);
 	cu->agg_use_two_regs = arch__agg_use_two_regs(&ehdr);
 	cu->arg_align_two_regs = arch__arg_align_two_regs(&ehdr);
+	cu->param_loc_supported = arch__param_loc_supported(&ehdr);
 	arch__set_register_params(&ehdr, cu);
 	return 0;
 }
