@@ -2968,7 +2968,7 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		encoder->tag_kfuncs	 = conf_load->btf_decl_tag_kfuncs;
 		encoder->gen_distilled_base = conf_load->btf_gen_distilled_base;
 		encoder->encode_attributes = conf_load->btf_attributes;
-		encoder->true_signature = conf_load->true_signature;
+		encoder->true_signature = conf_load->true_signature && cu->param_loc_supported;
 		encoder->verbose	 = verbose;
 		encoder->has_index_type  = false;
 		encoder->need_index_type = false;
