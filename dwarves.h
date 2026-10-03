@@ -46,6 +46,13 @@ enum load_steal_kind {
 	LSK__ABORT,
 };
 
+/* For older libbpf may need to define BTF location data kinds. */
+#ifndef BTF_KIND_LOC_PARAM
+#define BTF_KIND_LOC_PARAM	20
+#define BTF_KIND_LOC_PROTO	21
+#define BTF_KIND_LOCSEC		22
+#endif
+
 struct btf_new_opts;
 
 /*
@@ -58,6 +65,13 @@ __weak extern int btf__add_enum64_value(struct btf *btf, const char *name, __u64
 __weak extern int btf__add_type_attr(struct btf *btf, const char *value, int ref_type_id);
 __weak extern int btf__distill_base(const struct btf *src_btf, struct btf **new_base_btf, struct btf **new_split_btf);
 __weak extern struct btf *btf__new_empty_opts(struct btf_new_opts *opts);
+__weak extern int btf__add_loc_param(struct btf *btf, __u32 size, __u32 flags);
+__weak extern int btf__add_loc_param_value(struct btf *btf, __u32 value);
+__weak extern int btf__add_loc_proto(struct btf *btf);
+__weak extern int btf__add_loc_proto_param(struct btf *btf, __u32 id);
+__weak extern int btf__add_locsec(struct btf *btf, const char *name);
+__weak extern int btf__add_locsec_loc(struct btf *btf, __u32 func,
+				      __u32 loc_proto, __u32 offset);
 
 /*
  * BTF combines all the types into one big CU using btf_dedup(), so for something
@@ -104,6 +118,7 @@ struct conf_load {
 	bool			reproducible_build;
 	bool			btf_decl_tag_kfuncs;
 	bool			btf_gen_distilled_base;
+	bool			btf_gen_inlines;
 	bool			btf_attributes;
 	bool			true_signature;
 	uint8_t			hashtable_bits;
@@ -277,12 +292,23 @@ struct debug_fmt_ops {
 	bool		   has_alignment_info;
 };
 
+/* A BTF LOCSEC record describing one inline expansion. */
+struct function;
+struct btf_inline_site {
+	struct list_head node;
+	struct function *function;
+	char		 *section_name;
+	uint32_t	 section_offset;
+	uint32_t	 loc_proto;
+};
+
 #define ARCH_MAX_REGISTER_PARAMS	8
 
 struct cu {
 	struct list_head node;
 	struct list_head tags;
 	struct list_head tool_list;	/* To be used by tools such as ctracer */
+	struct list_head btf_inline_sites;
 	struct ptr_table types_table;
 	struct ptr_table functions_table;
 	struct ptr_table tags_table;
@@ -473,6 +499,19 @@ bool languages__cu_filtered(struct languages *languages, struct cu *cu, bool ver
 		else
 
 /**
+ * cu__for_each_inline_expansion - iterate thru all inline expansions
+ * @cu: struct cu instance to iterate
+ * @id: uint32_t tag id
+ * @pos: struct inline_expansion iterator
+ */
+#define cu__for_each_inline_expansion(cu, id, pos)	\
+	for (id = 0; id < cu->tags_table.nr_entries; ++id) \
+		if (!tag__is_inline_expansion(cu->tags_table.entries[id]) || \
+		    !(pos = tag__inline_expansion(cu->tags_table.entries[id]))) \
+			continue;			\
+		else
+
+/**
  * cu__for_each_namespace - iterate thru all the global namespace tags
  * @cu: struct cu instance to iterate
  * @pos: struct tag iterator
@@ -600,6 +639,11 @@ static inline bool tag__is_variable(const struct tag *tag)
 static inline bool tag__is_constant(const struct tag *tag)
 {
 	return tag->tag == DW_TAG_constant;
+}
+
+static inline bool tag__is_inline_expansion(const struct tag *tag)
+{
+	return tag && tag->tag == DW_TAG_inlined_subroutine;
 }
 
 static inline bool tag__is_volatile(const struct tag *tag)
@@ -821,10 +865,17 @@ struct ip_tag {
 	uint64_t   addr;
 };
 
+struct function;
+struct parameter;
+
 struct inline_expansion {
 	struct ip_tag	 ip;
+	const char	 *name;
 	size_t		 size;
 	uint64_t	 high_pc;
+	struct list_head parms;
+	struct function	 *function;
+	uint16_t	 nr_parms;
 };
 
 static inline struct inline_expansion *
@@ -832,6 +883,17 @@ static inline struct inline_expansion *
 {
 	return (struct inline_expansion *)tag;
 }
+
+void inline_expansion__add_parameter(struct inline_expansion *exp,
+				     struct parameter *parm);
+
+/**
+ * inline_expansion__for_each_parameter - iterate thru all the parameters
+ * @ie: struct inline_expansion instance to iterate
+ * @pos: struct parameter iterator
+ */
+#define inline_expansion__for_each_parameter(ie, pos) \
+	list_for_each_entry(pos, &(ie)->parms, tag.node)
 
 struct label {
 	struct ip_tag	 ip;
@@ -948,12 +1010,19 @@ struct parameter {
 	unsigned long first_reg_fields;
 	unsigned long second_reg_fields;
 	int loc_reg;
+	int loc_reg2;
+	int32_t loc_offset;
+	uint64_t loc_value;
 	uint16_t type_byte_size;
+	uint8_t loc_size;
 	uint8_t true_sig_type_from_types:1;
 	uint8_t true_sig_type_from_alt:1;
 	uint8_t has_const_value:1;
 	uint8_t loc_const_value:1;
 	uint8_t loc_stack:1;
+	uint8_t loc_deref:1;
+	uint8_t loc_addr:1;
+	uint8_t loc_signed:1;
 	uint8_t optimized:1;
 	uint8_t unexpected_reg:1;
 	uint8_t has_loc:1;

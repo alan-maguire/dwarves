@@ -1730,10 +1730,121 @@ static bool dwarf_expr__has_stack_value(Dwarf_Op *expr, size_t exprlen)
 	return false;
 }
 
+static uint8_t parameter__loc_size(const struct parameter *parm, const struct cu *cu)
+{
+	uint16_t size = parm->type_byte_size ?: cu->addr_size;
+
+	/* BTF_LOC_PARAM can describe values up to 16 bytes. */
+	if (size == 0 || size > 16)
+		return 0;
+	return size;
+}
+
+static bool dwarf_op__const_signed(unsigned int atom)
+{
+	switch (atom) {
+	case DW_OP_const1s:
+	case DW_OP_const2s:
+	case DW_OP_const4s:
+	case DW_OP_const8s:
+	case DW_OP_consts:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int64_t dwarf_op__snumber(const Dwarf_Op *op)
+{
+	return (int64_t)(Dwarf_Sword)op->number;
+}
+
+static uint64_t dwarf_op__const_value(const Dwarf_Op *op)
+{
+	if (dwarf_op__const_signed(op->atom))
+		return (uint64_t)dwarf_op__snumber(op);
+	return op->number;
+}
+
 static void parameter__set_loc_reg(struct parameter *parm, int reg)
 {
 	if (parm->loc_reg == PARAMETER_UNKNOWN_REG)
 		parm->loc_reg = reg;
+}
+
+static void parameter__record_loc_reg(struct parameter *parm, int reg,
+				      int64_t offset, bool is_deref,
+				      uint8_t size)
+{
+	if (reg < DW_OP_reg0 || !size)
+		return;
+
+	parameter__set_loc_reg(parm, reg);
+
+	if (parm->loc_reg != reg)
+		return;
+	if (offset < INT32_MIN || offset > INT32_MAX)
+		return;
+
+	parm->loc_offset = offset;
+	parm->loc_deref = is_deref;
+	parm->loc_size = size;
+}
+
+static void parameter__record_loc_reg_pair(struct parameter *parm, int reg,
+					   int reg2)
+{
+	uint16_t size = parm->type_byte_size;
+
+	/* LOC_PARAM supports a complete two-register value of up to 16 bytes. */
+	if (reg < DW_OP_reg0 || reg2 < DW_OP_reg0 || !size || size > 16)
+		return;
+
+	parm->loc_reg = reg;
+	parm->loc_reg2 = reg2;
+	parm->loc_offset = 0;
+	parm->loc_deref = 0;
+	parm->loc_size = size;
+}
+
+static void parameter__record_loc_const(struct parameter *parm, uint64_t value,
+					uint8_t size, bool is_signed,
+					bool is_addr)
+{
+	if (!size)
+		return;
+
+	parm->loc_const_value = 1;
+	parm->loc_value = value;
+	parm->loc_size = size;
+	parm->loc_signed = is_signed;
+	parm->loc_addr = is_addr;
+}
+
+static bool parameter__record_attr_const_value(Dwarf_Attribute *attr,
+					       struct cu *cu,
+					       struct parameter *parm)
+{
+	Dwarf_Sword svalue;
+	Dwarf_Word uvalue;
+
+	if (dwarf_formudata(attr, &uvalue) == 0) {
+		parm->loc_value = uvalue;
+		parm->loc_size = parameter__loc_size(parm, cu);
+		parm->loc_signed = 0;
+		parm->loc_addr = 0;
+		return true;
+	}
+
+	if (dwarf_formsdata(attr, &svalue) == 0) {
+		parm->loc_value = (uint64_t)svalue;
+		parm->loc_size = parameter__loc_size(parm, cu);
+		parm->loc_signed = 1;
+		parm->loc_addr = 0;
+		return true;
+	}
+
+	return false;
 }
 
 static void parameter__set_field_bit(unsigned long *fields, int byte_offset)
@@ -1795,24 +1906,43 @@ static void parameter__finish_piece_decode(struct parameter *parm, Dwarf_Die *di
 static void parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu,
 				   size_t exprlen, struct parameter *parm)
 {
+	int regs[2], nregs = 0;
+	uint64_t piece_size = 0;
+	bool reg_pieces = true;
+
 	switch (expr[0].atom) {
 	case DW_OP_lit0 ... DW_OP_lit31:
 	case DW_OP_constu:
 	case DW_OP_consts:
-		if (loc_num == 0)
-			parm->loc_const_value = 1;
+		if (loc_num == 0) {
+			uint64_t value = expr[0].atom;
+
+			if (expr[0].atom >= DW_OP_lit0 && expr[0].atom <= DW_OP_lit31)
+				value -= DW_OP_lit0;
+			else
+				value = dwarf_op__const_value(&expr[0]);
+			parameter__record_loc_const(parm, value,
+						    parameter__loc_size(parm, cu),
+						    dwarf_op__const_signed(expr[0].atom), false);
+		}
 		return;
 	}
 
 	if (parm->type_byte_size <= cu->addr_size || !cu->agg_use_two_regs) {
+		bool had_stack_value = dwarf_expr__has_stack_value(expr, exprlen);
+		uint8_t size = parameter__loc_size(parm, cu);
+
 		switch (expr[0].atom) {
 		case DW_OP_reg0 ... DW_OP_reg31:
 			if (loc_num == 0)
-				parameter__set_loc_reg(parm, expr[0].atom);
+				parameter__record_loc_reg(parm, expr[0].atom, 0, false, size);
 			return;
 		case DW_OP_breg0 ... DW_OP_breg31:
-			if (loc_num == 0 && dwarf_expr__has_stack_value(expr, exprlen))
-				parameter__set_loc_reg(parm, expr[0].atom - DW_OP_breg0 + DW_OP_reg0);
+			if (loc_num == 0)
+				parameter__record_loc_reg(parm,
+							  expr[0].atom - DW_OP_breg0 + DW_OP_reg0,
+							  dwarf_op__snumber(&expr[0]),
+							  !had_stack_value, size);
 			return;
 		default:
 			return;
@@ -1822,6 +1952,10 @@ static void parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu,
 	int off = 0;
 	for (size_t i = 0; i < exprlen; i++) {
 		if (expr[i].atom == DW_OP_piece) {
+			if (i == 0 || !dwarf_op__is_reg(expr[i - 1].atom))
+				reg_pieces = false;
+			else
+				piece_size += expr[i].number;
 			int num = expr[i].number;
 
 			if (i == 0) {
@@ -1835,13 +1969,26 @@ static void parameter__multi_exprs(Dwarf_Op *expr, int loc_num, struct cu *cu,
 				parameter__set_field_bit(&parm->second_reg_fields, off - cu->addr_size);
 			off += num;
 		} else if (dwarf_op__is_reg(expr[i].atom)) {
-			if (off < cu->addr_size || parm->loc_reg == PARAMETER_UNKNOWN_REG)
-				parameter__set_loc_reg(parm, expr[i].atom);
+			int reg = expr[i].atom - DW_OP_reg0;
+
+			if (nregs < ARRAY_SIZE(regs))
+				regs[nregs++] = reg;
+			else
+				reg_pieces = false;
+			if (off < cu->addr_size || parm->loc_reg == PARAMETER_UNKNOWN_REG) {
+				uint8_t size = parameter__loc_size(parm, cu);
+
+				parameter__record_loc_reg(parm, expr[i].atom, 0, false, size);
+			}
+		} else {
+			reg_pieces = false;
 		}
-		/* FIXME: not handling DW_OP_bregX pieces yet since we do not
-		 * have a use case for it yet in the Linux kernel.
-		 */
 	}
+
+	if (loc_num == 0 && reg_pieces && nregs == ARRAY_SIZE(regs) &&
+	    piece_size == parm->type_byte_size)
+		parameter__record_loc_reg_pair(parm, DW_OP_reg0 + regs[0],
+					       DW_OP_reg0 + regs[1]);
 }
 
 static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *conf,
@@ -1857,46 +2004,90 @@ static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *
 
 	libdw__lock_lock();
 	while ((offset = __dwarf_getlocations(attr, offset, &base, &start, &end, &expr, &exprlen)) > 0) {
-		bool had_stack_value;
+		bool had_stack_value = false, had_deref = false;
+		uint8_t size = 0;
 
 		loc_num++;
 		if (exprlen == 0)
 			continue;
 
+		/*
+		 * Expressions can have form
+		 * DW_OP_fbreg -40, DW_OP_stack_value ; or
+		 * DW_OP_fbreg -40, DW_OP_deref[_size], DW_OP_stack_value
+		 *
+		 * In the absence of the stack value, breg/fbreg are
+		 * implicitly dereferences; with it they are non-dereference
+		 * calculations of register + offset.  So below we mark
+		 * dereferences as either explicit (from DW_OP_deref*)
+		 * or implicit (!had_stack_value for fbreg/breg).
+		 */
 		had_stack_value = expr[exprlen - 1].atom == DW_OP_stack_value;
-		if (exprlen == 2 && had_stack_value)
+		if (had_stack_value)
 			exprlen--;
+		if (exprlen > 0) {
+			had_deref = expr[exprlen - 1].atom == DW_OP_deref ||
+				    expr[exprlen - 1].atom == DW_OP_deref_size;
+			if (had_deref)
+				exprlen--;
+		}
+		if (exprlen == 0)
+			continue;
 
 		if (exprlen != 1) {
 			parameter__multi_exprs(expr, loc_num, cu, exprlen, parm);
 			continue;
 		}
 
+		size = parameter__loc_size(parm, cu);
+
 		switch (expr->atom) {
 		case DW_OP_reg0 ... DW_OP_reg31:
 			if (loc_num == 0)
-				parameter__set_loc_reg(parm, expr->atom);
+				parameter__record_loc_reg(parm, expr->atom, 0, false, size);
 			break;
 		case DW_OP_breg0 ... DW_OP_breg31:
-			if (loc_num == 0 && had_stack_value)
-				parameter__set_loc_reg(parm, expr->atom - DW_OP_breg0 + DW_OP_reg0);
+			if (loc_num == 0)
+				parameter__record_loc_reg(parm,
+							  expr->atom - DW_OP_breg0 + DW_OP_reg0,
+							  dwarf_op__snumber(expr),
+							  had_deref || !had_stack_value,
+							  size);
 			break;
 		case DW_OP_fbreg:
-			if (loc_num == 0)
+			if (loc_num == 0 && size) {
+				int64_t loc_offset = dwarf_op__snumber(expr);
+
 				parm->loc_stack = 1;
+				if (loc_offset >= INT32_MIN && loc_offset <= INT32_MAX)
+					parm->loc_offset = (int32_t)loc_offset;
+				parm->loc_size = size;
+				parm->loc_deref = had_deref || !had_stack_value;
+			}
 			break;
 		case DW_OP_lit0 ... DW_OP_lit31:
-		case DW_OP_constu:
-		case DW_OP_consts:
 			if (loc_num == 0)
-				parm->loc_const_value = 1;
+				parameter__record_loc_const(parm, expr->atom - DW_OP_lit0,
+							    size, false, false);
+			break;
+		case DW_OP_const1u ... DW_OP_consts:
+			if (loc_num == 0)
+				parameter__record_loc_const(parm, dwarf_op__const_value(expr),
+							    size,
+							    dwarf_op__const_signed(expr->atom),
+							    false);
+			break;
+		case DW_OP_addr:
+			if (loc_num == 0)
+				parameter__record_loc_const(parm, expr->number, cu->addr_size,
+							    false, true);
 			break;
 		case DW_OP_entry_value:
 		case DW_OP_GNU_entry_value:
 			if (dwarf_getlocation_attr(attr, expr, &entry_attr) == 0 &&
 			    dwarf_getlocation(&entry_attr, &entry_ops, &entry_len) == 0 &&
 			    entry_len == 1 && dwarf_op__is_reg(entry_ops->atom))
-				parameter__set_loc_reg(parm, entry_ops->atom);
+				parameter__record_loc_reg(parm, entry_ops->atom, 0, false, size);
 			break;
 		}
 	}
@@ -1906,7 +2097,8 @@ static void parameter__decode_location(Dwarf_Attribute *attr, struct conf_load *
 }
 
 static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct conf_load *conf,
-					struct ftype *ftype, int param_idx)
+					struct ftype *ftype, int param_idx,
+					bool decode_location)
 {
 	struct parameter *parm = tag__alloc(cu, sizeof(*parm));
 
@@ -1917,7 +2109,8 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct co
 		parm->name = attr_string(die, DW_AT_name, conf);
 		parm->idx = param_idx;
 		parm->loc_reg = PARAMETER_UNKNOWN_REG;
-		if (!ftype)
+		parm->loc_reg2 = PARAMETER_UNKNOWN_REG;
+		if (!decode_location)
 			return parm;
 
 		parm->type_byte_size = get_type_byte_size(die, cu);
@@ -1958,6 +2151,8 @@ static struct parameter *parameter__new(Dwarf_Die *die, struct cu *cu, struct co
 		 * ftype__recode_dwarf_types() below for how this is handled.
 		 */
 		parm->has_const_value = dwarf_attr(die, DW_AT_const_value, &attr) != NULL;
+		if (parm->has_const_value)
+			parameter__record_attr_const_value(&attr, cu, parm);
 		parm->has_loc = dwarf_attr(die, DW_AT_location, &attr) != NULL;
 		if (parm->has_loc)
 			parameter__decode_location(&attr, conf, cu, die, parm);
@@ -1980,7 +2175,7 @@ static int formal_parameter_pack__load_params(struct formal_parameter_pack *pack
 			continue;
 		}
 
-		struct parameter *param = parameter__new(die, cu, conf, NULL, -1);
+		struct parameter *param = parameter__new(die, cu, conf, NULL, -1, false);
 
 		if (param == NULL)
 			return -1;
@@ -2015,20 +2210,32 @@ static struct inline_expansion *inline_expansion__new(Dwarf_Die *die, struct cu 
 
 	if (exp != NULL) {
 		struct dwarf_tag *dtag = tag__dwarf(&exp->ip.tag);
+		Dwarf_Attribute attr_orig;
 
 		tag__init(&exp->ip.tag, cu, die);
 		dtag->decl_file = attr_string(die, DW_AT_call_file, conf);
 		dtag->decl_line = attr_numeric(die, DW_AT_call_line);
 		dwarf_tag__set_attr_type(dtag, DWARF_TAG__REF_TYPE, die, DW_AT_abstract_origin, cu);
+		exp->name = NULL;
+		if (dwarf_attr(die, DW_AT_abstract_origin, &attr_orig)) {
+			Dwarf_Die die_orig;
+
+			if (dwarf_formref_die(&attr_orig, &die_orig) &&
+			    dwarf_tag(&die_orig) == DW_TAG_subprogram)
+				exp->name = attr_string(&die_orig, DW_AT_name, conf);
+		}
+
 		exp->ip.addr = 0;
 		exp->high_pc = 0;
+		exp->nr_parms = 0;
+		INIT_LIST_HEAD(&exp->parms);
 
 		if (!cu->has_addr_info)
 			goto out;
 
 		if (dwarf_lowpc(die, &exp->ip.addr))
 			exp->ip.addr = 0;
-		if (dwarf_lowpc(die, &exp->high_pc))
+		if (dwarf_highpc(die, &exp->high_pc))
 			exp->high_pc = 0;
 
 		exp->size = exp->high_pc - exp->ip.addr;
@@ -2559,10 +2766,12 @@ static struct tag *die__create_new_string_type(Dwarf_Die *die, struct cu *cu)
 static struct tag *die__create_new_parameter(Dwarf_Die *die,
 					     struct ftype *ftype,
 					     struct lexblock *lexblock,
+					     struct inline_expansion *exp,
 					     struct cu *cu, struct conf_load *conf,
 					     int param_idx)
 {
-	struct parameter *parm = parameter__new(die, cu, conf, ftype, param_idx);
+	struct parameter *parm = parameter__new(die, cu, conf, ftype, param_idx,
+					       ftype != NULL || exp != NULL);
 
 	if (parm == NULL)
 		return NULL;
@@ -2575,7 +2784,7 @@ static struct tag *die__create_new_parameter(Dwarf_Die *die,
 			if (add_gnu_annotation_chain(die, param_idx, conf, &(tag__function(&ftype->tag)->annots)))
 				return NULL;
 		}
-	} else {
+	} else if (exp == NULL) {
 		/*
 		 * DW_TAG_formal_parameters on a non DW_TAG_subprogram nor
 		 * DW_TAG_subroutine_type tag happens sometimes, likely due to
@@ -2656,7 +2865,7 @@ static struct tag *die__create_new_subroutine_type(Dwarf_Die *die,
 			tag__print_not_supported(die);
 			continue;
 		case DW_TAG_formal_parameter:
-			tag = die__create_new_parameter(die, ftype, NULL, cu, conf, -1);
+			tag = die__create_new_parameter(die, ftype, NULL, NULL, cu, conf, -1);
 			break;
 		case DW_TAG_unspecified_parameters:
 			ftype->unspec_parms = 1;
@@ -2946,10 +3155,14 @@ static struct tag *die__create_new_inline_expansion(Dwarf_Die *die,
 						    struct lexblock *lexblock,
 						    struct cu *cu, struct conf_load *conf);
 
-static int die__process_inline_expansion(Dwarf_Die *die, struct lexblock *lexblock, struct cu *cu, struct conf_load *conf)
+static int die__process_inline_expansion(Dwarf_Die *die,
+					 struct inline_expansion *exp,
+					 struct lexblock *lexblock,
+					 struct cu *cu, struct conf_load *conf)
 {
 	Dwarf_Die child;
 	struct tag *tag;
+	int parm_idx = 0;
 
 	if (!dwarf_haschildren(die) || dwarf_child(die, &child) != 0)
 		return 0;
@@ -2975,13 +3188,9 @@ static int die__process_inline_expansion(Dwarf_Die *die, struct lexblock *lexblo
 				goto out_enomem;
 			continue;
 		case DW_TAG_formal_parameter:
-			/*
-			 * Inline expansions can have their own formal
-			 * parameter children duplicating the abstract
-			 * origin's parameters.  These are not needed
-			 * for type reconstruction — skip them.
-			 */
-			continue;
+			tag = die__create_new_parameter(die, NULL, lexblock, exp,
+							cu, conf, parm_idx++);
+			break;
 		case DW_TAG_inlined_subroutine:
 			tag = die__create_new_inline_expansion(die, lexblock, cu, conf);
 			break;
@@ -3010,6 +3219,8 @@ static int die__process_inline_expansion(Dwarf_Die *die, struct lexblock *lexblo
 
 		if (cu__table_add_tag(cu, tag, &id) < 0)
 			goto out_delete_tag;
+		if (tag->tag == DW_TAG_formal_parameter)
+			inline_expansion__add_parameter(exp, tag__parameter(tag));
 hash:
 		cu__hash(cu, tag);
 		struct dwarf_tag *dtag = tag__dwarf(tag);
@@ -3032,8 +3243,8 @@ static struct tag *die__create_new_inline_expansion(Dwarf_Die *die,
 	if (exp == NULL)
 		return NULL;
 
-	if (die__process_inline_expansion(die, lexblock, cu, conf) != 0) {
-		tag__free(&exp->ip.tag, cu);
+	if (die__process_inline_expansion(die, exp, lexblock, cu, conf) != 0) {
+		tag__delete(&exp->ip.tag, cu);
 		return NULL;
 	}
 
@@ -3115,7 +3326,8 @@ static int die__process_function(Dwarf_Die *die, struct ftype *ftype,
 			continue;
 		}
 		case DW_TAG_formal_parameter:
-			tag = die__create_new_parameter(die, ftype, lexblock, cu, conf, param_idx++);
+			tag = die__create_new_parameter(die, ftype, lexblock, NULL,
+							cu, conf, param_idx++);
 			break;
 		case DW_TAG_variable:
 			tag = die__create_new_variable(die, cu, conf, 0);
@@ -3562,75 +3774,156 @@ static void __tag__print_abstract_origin_not_found(struct tag *tag,
 #define tag__print_abstract_origin_not_found(tag) \
 	__tag__print_abstract_origin_not_found(tag, __func__, __LINE__)
 
+static void function__recode_dwarf_name(struct tag *tag, struct cu *cu)
+{
+	struct function *fn = tag__function(tag);
+	struct dwarf_tag *dtag = tag__dwarf(tag);
+	struct dwarf_tag *dtype;
+
+	if (fn->name != 0)
+		return;
+	if (dtag->abstract_origin == 0 && dtag->specification == 0)
+		return;
+
+	dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
+	if (dtype == NULL)
+		dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
+	if (dtype != NULL)
+		fn->name = tag__function(dtag__tag(dtype))->name;
+	else {
+		fprintf(stderr,
+			"%s: couldn't find name for function %#llx, abstract_origin=%#llx, specification=%#llx\n",
+			__func__,
+			(unsigned long long)dtag->id,
+			(unsigned long long)dtag->abstract_origin,
+			(unsigned long long)dtag->specification);
+	}
+}
+
+static void parameter__share_state_with_abstract_origin(struct parameter *parm,
+							struct parameter *oparm)
+{
+	if (parm->has_loc)
+		oparm->has_loc = parm->has_loc;
+	if (parm->has_const_value)
+		oparm->has_const_value = parm->has_const_value;
+	if (parm->loc_const_value)
+		oparm->loc_const_value = parm->loc_const_value;
+	if (parm->loc_stack)
+		oparm->loc_stack = parm->loc_stack;
+	if (parm->loc_reg != PARAMETER_UNKNOWN_REG)
+		oparm->loc_reg = parm->loc_reg;
+	if (parm->loc_reg2 != PARAMETER_UNKNOWN_REG)
+		oparm->loc_reg2 = parm->loc_reg2;
+	if (parm->has_const_value || parm->loc_const_value || parm->loc_stack ||
+	    parm->loc_reg != PARAMETER_UNKNOWN_REG) {
+		oparm->loc_offset = parm->loc_offset;
+		oparm->loc_value = parm->loc_value;
+		oparm->loc_size = parm->loc_size;
+		oparm->loc_deref = parm->loc_deref;
+		oparm->loc_addr = parm->loc_addr;
+		oparm->loc_signed = parm->loc_signed;
+	}
+	if (parm->type_byte_size != 0)
+		oparm->type_byte_size = parm->type_byte_size;
+	if (parm->passed_in_memory)
+		oparm->passed_in_memory = parm->passed_in_memory;
+	oparm->first_reg_fields |= parm->first_reg_fields;
+	oparm->second_reg_fields |= parm->second_reg_fields;
+	if (parm->true_sig_member_name && !oparm->true_sig_member_name) {
+		oparm->true_sig_member_name = parm->true_sig_member_name;
+		oparm->true_sig_type = parm->true_sig_type;
+		oparm->true_sig_type_from_types = parm->true_sig_type_from_types;
+	}
+	if (parm->optimized)
+		oparm->optimized = parm->optimized;
+	if (parm->unexpected_reg)
+		oparm->unexpected_reg = parm->unexpected_reg;
+}
+
+static void parameter__recode_dwarf_type(struct parameter *parm, struct cu *cu,
+					 struct ftype *ftype)
+{
+	struct dwarf_cu *dcu = cu->priv;
+	struct dwarf_tag *dparm = tag__dwarf(&parm->tag);
+	struct dwarf_tag *dtype;
+
+	if (dparm->type == 0) {
+		struct parameter *oparm;
+
+		if (dparm->abstract_origin == 0) {
+			parm->tag.type = 0;
+			return;
+		}
+
+		dtype = dwarf_cu__find_tag_by_ref(dcu, dparm, abstract_origin);
+		if (dtype == NULL) {
+			tag__print_abstract_origin_not_found(&parm->tag);
+			return;
+		}
+
+		oparm = tag__parameter(dtag__tag(dtype));
+		parm->name = oparm->name;
+		if (ftype != NULL) {
+			if (parm->idx != oparm->idx)
+				ftype->reordered_parm = 1;
+		} else {
+			parm->idx = oparm->idx;
+		}
+		parm->tag.type = dtag__tag(dtype)->type;
+		if (ftype != NULL)
+			parameter__share_state_with_abstract_origin(parm, oparm);
+		return;
+	}
+
+	dtype = dwarf_cu__find_type_by_ref(dcu, dparm, type);
+	if (dtype == NULL) {
+		tag__print_type_not_found(&parm->tag);
+		return;
+	}
+	parm->tag.type = dtype->small_id;
+}
+
 static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu)
 {
-	struct parameter *pos;
-	struct dwarf_cu *dcu = cu->priv;
 	struct ftype *type = tag__ftype(tag);
+	struct parameter *pos;
 
-	ftype__for_each_parameter(type, pos) {
-		struct dwarf_tag *dpos = tag__dwarf(&pos->tag);
-		struct parameter *opos;
-		struct dwarf_tag *dtype;
+	ftype__for_each_parameter(type, pos)
+		parameter__recode_dwarf_type(pos, cu, type);
+}
 
-		if (dpos->type == 0) {
-			if (dpos->abstract_origin == 0) {
-				/* Function without parameters */
-				pos->tag.type = 0;
-				continue;
-			}
-			dtype = dwarf_cu__find_tag_by_ref(dcu, dpos, abstract_origin);
-			if (dtype == NULL) {
-				tag__print_abstract_origin_not_found(&pos->tag);
-				continue;
-			}
-			opos = tag__parameter(dtag__tag(dtype));
-			pos->name = opos->name;
-			if (pos->idx != opos->idx)
-				type->reordered_parm = 1;
-			pos->tag.type = dtag__tag(dtype)->type;
-			/* share location information between parameter and
-			 * abstract origin; if neither have location, we will
-			 * mark the parameter as optimized out.  Also share
-			 * info regarding unexpected register use for
-			 * parameters.
-			 */
-			if (pos->has_loc)
-				opos->has_loc = pos->has_loc;
-			if (pos->has_const_value)
-				opos->has_const_value = pos->has_const_value;
-			if (pos->loc_const_value)
-				opos->loc_const_value = pos->loc_const_value;
-			if (pos->loc_stack)
-				opos->loc_stack = pos->loc_stack;
-			if (pos->loc_reg != PARAMETER_UNKNOWN_REG)
-				opos->loc_reg = pos->loc_reg;
-			if (pos->type_byte_size != 0)
-				opos->type_byte_size = pos->type_byte_size;
-			if (pos->passed_in_memory)
-				opos->passed_in_memory = pos->passed_in_memory;
-			opos->first_reg_fields |= pos->first_reg_fields;
-			opos->second_reg_fields |= pos->second_reg_fields;
-			if (pos->true_sig_member_name && !opos->true_sig_member_name) {
-				opos->true_sig_member_name = pos->true_sig_member_name;
-				opos->true_sig_type = pos->true_sig_type;
-				opos->true_sig_type_from_types = pos->true_sig_type_from_types;
-			}
+static void inline_expansion__recode_dwarf_types(struct tag *tag, struct cu *cu)
+{
+	struct dwarf_cu *dcu = cu->priv;
+	struct dwarf_tag *dtag = tag__dwarf(tag);
+	struct dwarf_tag *dtype;
+	struct tag *origin;
+	struct tag *pos;
+	struct inline_expansion *exp = tag__inline_expansion(tag);
 
-			if (pos->optimized)
-				opos->optimized = pos->optimized;
-			if (pos->unexpected_reg)
-				opos->unexpected_reg = pos->unexpected_reg;
-			continue;
-		}
+	exp->function = NULL;
 
-		dtype = dwarf_cu__find_type_by_ref(dcu, dpos, type);
-		if (dtype == NULL) {
-			tag__print_type_not_found(&pos->tag);
-			continue;
-		}
-		pos->tag.type = dtype->small_id;
+	/* The inline expansion's abstract origin is stored as its type ref. */
+	dtype = dwarf_cu__find_tag_by_ref(dcu, dtag, type);
+	if (dtype == NULL) {
+		tag__print_type_not_found(tag);
+		tag__check_pruned_alt_ref(dcu, dtag->type, dtag->from_alt.type);
+		exp->name = NULL;
+		return;
 	}
+
+	origin = dtag__tag(dtype);
+	if (tag__is_function(origin)) {
+		function__recode_dwarf_name(origin, cu);
+		exp->function = tag__function(origin);
+		exp->name = function__name(exp->function);
+	} else
+		exp->name = NULL;
+	ftype__recode_dwarf_types(origin, cu);
+	list_for_each_entry(pos, &exp->parms, node)
+		parameter__recode_dwarf_type(tag__parameter(pos), cu, NULL);
+	tag->type = dtype->small_id;
 }
 
 static struct parameter *ftype__next_parameter(struct ftype *ftype, struct parameter *parm)
@@ -3885,23 +4178,7 @@ static void lexblock__recode_dwarf_types(struct lexblock *tag, struct cu *cu)
 			lexblock__recode_dwarf_types(tag__lexblock(pos), cu);
 			continue;
 		case DW_TAG_inlined_subroutine:
-			if (dpos->type != 0)
-				dtype = dwarf_cu__find_tag_by_ref(dcu, dpos, type);
-			else
-				dtype = dwarf_cu__find_tag_by_ref(dcu, dpos, abstract_origin);
-			if (dtype == NULL) {
-				if (dpos->type != 0) {
-					tag__print_type_not_found(pos);
-					tag__check_pruned_alt_ref(dcu, dpos->type,
-								  dpos->from_alt.type);
-				} else {
-					tag__print_abstract_origin_not_found(pos);
-					tag__check_pruned_alt_ref(dcu, dpos->abstract_origin,
-								  dpos->from_alt.abstract_origin);
-				}
-				continue;
-			}
-			ftype__recode_dwarf_types(dtag__tag(dtype), cu);
+			inline_expansion__recode_dwarf_types(pos, cu);
 			continue;
 
 		case DW_TAG_formal_parameter:
@@ -4035,20 +4312,7 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 				 */
 				return 0;
 			}
-			dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, abstract_origin);
-			if (dtype == NULL)
-				dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, specification);
-			if (dtype != NULL)
-				fn->name = tag__function(dtag__tag(dtype))->name;
-			else {
-				fprintf(stderr,
-					"%s: couldn't find name for "
-					"function %#llx, abstract_origin=%#llx,"
-					" specification=%#llx\n", __func__,
-					(unsigned long long)dtag->id,
-					(unsigned long long)dtag->abstract_origin,
-					(unsigned long long)dtag->specification);
-			}
+			function__recode_dwarf_name(tag, cu);
 		}
 		lexblock__recode_dwarf_types(&fn->lexblock, cu);
 	}
@@ -4081,15 +4345,9 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 
 	case DW_TAG_namespace:
 		return namespace__recode_dwarf_types(tag, cu);
-	/*
-	 * DW_TAG_inlined_subroutine uses DW_AT_abstract_origin to
-	 * reference the out-of-line subprogram.  inline_expansion__new()
-	 * stores this in dtag->type (not dtag->abstract_origin) via
-	 * dwarf_tag__set_attr_type() with DW_AT_abstract_origin.
-	 * For dwz binaries, the target subprogram lives in the alt file,
-	 * so dtag->from_alt.type drives the lookup to dcu->alt->hash_tags.
-	 */
 	case DW_TAG_inlined_subroutine:
+		inline_expansion__recode_dwarf_types(tag, cu);
+		return 0;
 	case DW_TAG_imported_module:
 		dtype = dwarf_cu__find_tag_by_ref(cu->priv, dtag, type);
 		goto check_type;
@@ -4172,37 +4430,32 @@ static int cu__resolve_func_ret_types_optimized(struct cu *cu, struct conf_load 
 			continue;
 
 		fn = tag__function(tag);
-		function__analyze_parameter_locations(fn, cu, conf);
-
-		/* mark function as optimized if parameter is, or
-		 * if parameter does not have a location; at this
-		 * point location presence has been marked in
-		 * abstract origins for cases where a parameter
-		 * location is not stored in the original function
-		 * parameter tag.
-		 *
-		 * Also mark functions which, due to optimization,
-		 * use an unexpected register for a parameter.
-		 * Exception is functions which have a struct
-		 * as a parameter, as multiple registers may
-		 * be used to represent it, throwing off register
-		 * to parameter mapping.
+		/* Abstract inline subprograms describe source signatures; their
+		 * concrete locations belong to DW_TAG_inlined_subroutine children.
 		 */
-		ftype__for_each_parameter(&fn->proto, pos) {
-			if (pos->optimized || !pos->has_loc)
-				fn->proto.optimized_parms = 1;
+		if (!function__inlined(fn)) {
+			function__analyze_parameter_locations(fn, cu, conf);
 
-			if (pos->unexpected_reg)
-				has_unexpected_reg = true;
-		}
-		if (has_unexpected_reg) {
+			/* Mark functions with optimized or location-less parameters, and
+			 * flag unexpected registers unless a struct parameter explains
+			 * the multi-register ABI representation.
+			 */
 			ftype__for_each_parameter(&fn->proto, pos) {
-				has_struct_param = param__is_struct(cu, &pos->tag);
-				if (has_struct_param)
-					break;
+				if (pos->optimized || !pos->has_loc)
+					fn->proto.optimized_parms = 1;
+
+				if (pos->unexpected_reg)
+					has_unexpected_reg = true;
 			}
-			if (!has_struct_param)
-				fn->proto.unexpected_reg = 1;
+			if (has_unexpected_reg) {
+				ftype__for_each_parameter(&fn->proto, pos) {
+					has_struct_param = param__is_struct(cu, &pos->tag);
+					if (has_struct_param)
+						break;
+				}
+				if (!has_struct_param)
+					fn->proto.unexpected_reg = 1;
+			}
 		}
 
 		if (tag == NULL || tag->type != 0)
