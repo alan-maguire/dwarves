@@ -331,6 +331,7 @@ struct cu {
 	uint8_t		 producer_clang:1;
 	uint8_t		 agg_use_two_regs:1;	/* An aggregate like {long a; long b;} */
 	uint8_t		 arg_align_two_regs:1;	/* An over-aligned arg starts on an even register */
+	uint8_t		 param_loc_supported:1;	/* Parameter location analysis is validated for this arch */
 	uint8_t		 nr_register_params;
 	int		 register_params[ARCH_MAX_REGISTER_PARAMS];
 	int		 functions_saved;
