@@ -4057,7 +4057,7 @@ static void function__match_clang_parameter_locations(struct ftype *ftype, struc
 		if (reg_idx >= cu->nr_register_params)
 			break;
 
-		if (pos->loc_reg != PARAMETER_UNKNOWN_REG &&
+		if (!pos->loc_deref && pos->loc_reg != PARAMETER_UNKNOWN_REG &&
 		    !parameter__reg_in_expected_window(pos, reg_idx, slots, cu))
 			pos->unexpected_reg = 1;
 
