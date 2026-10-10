@@ -169,6 +169,11 @@ struct alt_pu {
 	bool	  hit;		/* referenced by main CUs? */
 };
 
+struct excluded_cu {
+	Dwarf_Off start;
+	Dwarf_Off end;
+};
+
 struct dwarf_cu {
 	struct hlist_head *hash_tags;	/* tags (functions, etc.) keyed by DWARF offset */
 	struct hlist_head *hash_types;	/* types keyed by DWARF offset */
@@ -183,6 +188,10 @@ struct dwarf_cu {
 	uint32_t  nr_alt_pus;
 	uint32_t  allocated_alt_pus;
 	bool	  processing_alt;	/* true while processing alt-file DIEs */
+	struct excluded_cu *excluded_cus;	/* skipped by early_cu_filter when merging */
+	uint32_t  nr_excluded_cus;
+	Dwarf	  *dw;
+	struct conf_load *conf;
 };
 
 static int dwarf_cu__init(struct dwarf_cu *dcu, struct cu *cu)
@@ -215,6 +224,8 @@ static int dwarf_cu__init(struct dwarf_cu *dcu, struct cu *cu)
 	dcu->alt_pus = NULL;
 	dcu->nr_alt_pus = 0;
 	dcu->allocated_alt_pus = 0;
+	dcu->excluded_cus = NULL;
+	dcu->nr_excluded_cus = 0;
 	/*
 	 * processing_alt is per-merged-CU state, not thread-safe.
 	 * The merged-CU path (cus__merge_and_process_cu) is
@@ -249,6 +260,7 @@ static void dwarf_cu__delete(struct cu *cu)
 
 	zfree(&dcu->imported_units);
 	zfree(&dcu->alt_pus);
+	zfree(&dcu->excluded_cus);
 	if (dcu->alt) {
 		cu__free(cu, dcu->alt->hash_tags);
 		cu__free(cu, dcu->alt->hash_types);
@@ -475,6 +487,8 @@ static struct dwarf_tag *__dwarf_cu__find_tag_by_ref(const struct dwarf_cu *cu,
 				    dtag->from_types_section.field, \
 				    dtag->from_alt.field)
 
+static struct dwarf_tag *dwarf_cu__load_excluded_type(struct dwarf_cu *dcu, Dwarf_Off ref);
+
 /* Same as __dwarf_cu__find_tag_by_ref but for type lookups (hash_types). */
 static struct dwarf_tag *__dwarf_cu__find_type_by_ref(struct dwarf_cu *dcu,
 						      const Dwarf_Off ref,
@@ -497,6 +511,8 @@ static struct dwarf_tag *__dwarf_cu__find_type_by_ref(struct dwarf_cu *dcu,
 
 	struct dwarf_tag *dtag = hashtags__find(dcu->hash_types, ref);
 
+	if (dtag == NULL)
+		dtag = dwarf_cu__load_excluded_type(dcu, ref);
 	if (dtag)
 		dcu->last_type_lookup = dtag;
 
@@ -3693,6 +3709,62 @@ static int die__process_unit(Dwarf_Die *die, struct cu *cu, struct conf_load *co
 	return 0;
 }
 
+static int dwarf_cu__add_excluded_cu(struct dwarf_cu *dcu, Dwarf_Off start, Dwarf_Off end)
+{
+	struct excluded_cu *cus = realloc(dcu->excluded_cus,
+					  (dcu->nr_excluded_cus + 1) * sizeof(*cus));
+
+	if (cus == NULL)
+		return -ENOMEM;
+
+	cus[dcu->nr_excluded_cus++] = (struct excluded_cu){ .start = start, .end = end };
+	dcu->excluded_cus = cus;
+	return 0;
+}
+
+static bool dwarf_cu__in_excluded_cu(const struct dwarf_cu *dcu, Dwarf_Off offset)
+{
+	for (uint32_t i = 0; i < dcu->nr_excluded_cus; i++)
+		if (offset >= dcu->excluded_cus[i].start && offset < dcu->excluded_cus[i].end)
+			return true;
+	return false;
+}
+
+/*
+ * With LTO, LLVM emits a type such as int once, in the first CU that uses it,
+ * and other CUs refer to it with DW_FORM_ref_addr. So the CUs kept when merging
+ * can refer to types in CUs that early_cu_filter excluded. Load those types
+ * when they are looked up, and nothing else from the excluded CUs.
+ */
+static struct dwarf_tag *dwarf_cu__load_excluded_type(struct dwarf_cu *dcu, Dwarf_Off ref)
+{
+	struct tag *tag, die_tag = {};
+	uint32_t id = 0;
+	Dwarf_Die die;
+
+	if (!dwarf_cu__in_excluded_cu(dcu, ref) || dwarf_offdie(dcu->dw, ref, &die) == NULL)
+		return NULL;
+
+	/*
+	 * A using declaration can name a function, and processing a function
+	 * adds its parameters to the CU's tables, so check the tag first.
+	 */
+	die_tag.tag = dwarf_tag(&die);
+	if (!tag__is_tag_type(&die_tag))
+		return NULL;
+
+	tag = die__process_tag(&die, dcu->cu, 1, dcu->conf);
+	if (tag == NULL || tag == &unsupported_tag)
+		return NULL;
+
+	/* As in die__process_unit(). */
+	if (tag->tag != DW_TAG_unspecified_type)
+		cu__add_tag(dcu->cu, tag, &id);
+	cu__hash(dcu->cu, tag);
+	tag__dwarf(tag)->small_id = id;
+	return tag__dwarf(tag);
+}
+
 static void ftype__recode_dwarf_types(struct tag *tag, struct cu *cu);
 
 static int namespace__recode_dwarf_types(struct tag *tag, struct cu *cu)
@@ -4497,10 +4569,10 @@ static int cu__resolve_func_ret_types_optimized(struct cu *cu, struct conf_load 
 
 static int cu__recode_dwarf_types_table(struct cu *cu,
 					struct ptr_table *pt,
-					uint32_t i)
+					uint32_t *i)
 {
-	for (; i < pt->nr_entries; ++i) {
-		struct tag *tag = pt->entries[i];
+	for (; *i < pt->nr_entries; ++*i) {
+		struct tag *tag = pt->entries[*i];
 
 		if (tag != NULL) /* void, see cu__new */
 			if (tag__recode_dwarf_type(tag, cu))
@@ -4512,10 +4584,15 @@ static int cu__recode_dwarf_types_table(struct cu *cu,
 
 static int cu__recode_dwarf_types(struct cu *cu)
 {
-	if (cu__recode_dwarf_types_table(cu, &cu->types_table, 1) ||
-	    cu__recode_dwarf_types_table(cu, &cu->tags_table, 0) ||
-	    cu__recode_dwarf_types_table(cu, &cu->functions_table, 0))
-		return -1;
+	uint32_t types = 1, tags = 0, functions = 0;
+
+	/* Recoding can add tags, see dwarf_cu__load_excluded_type(). */
+	do {
+		if (cu__recode_dwarf_types_table(cu, &cu->types_table, &types) ||
+		    cu__recode_dwarf_types_table(cu, &cu->tags_table, &tags) ||
+		    cu__recode_dwarf_types_table(cu, &cu->functions_table, &functions))
+			return -1;
+	} while (types < cu->types_table.nr_entries || tags < cu->tags_table.nr_entries);
 	return 0;
 }
 
@@ -5366,6 +5443,8 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 
 			dcu->cu = cu;
 			dcu->type_unit = type_dcu;
+			dcu->dw = dw;
+			dcu->conf = conf;
 			cu->priv = dcu;
 			cu->dfops = &dwarf__ops;
 
@@ -5451,6 +5530,8 @@ static int cus__merge_and_process_cu(struct cus *cus, struct conf_load *conf,
 			};
 
 			filtered = conf->early_cu_filter(&unmerged_cu) == NULL;
+			if (filtered && dwarf_cu__add_excluded_cu(dcu, off, noff))
+				goto out_abort;
 		}
 
 		/*
