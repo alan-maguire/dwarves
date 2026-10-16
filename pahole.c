@@ -1253,6 +1253,7 @@ struct btf_feature {
 	BTF_NON_DEFAULT_FEATURE_CHECK(layout, btf_gen_layout, false, layout_check),
 	BTF_NON_DEFAULT_FEATURE_CHECK(inline, btf_gen_inlines, false, location_check),
 	BTF_NON_DEFAULT_FEATURE(force_cu_merging, force_cu_merging, false),
+	BTF_NON_DEFAULT_FEATURE(rust_bindgen_replace, rust_bindgen_replace, false),
 };
 
 #define BTF_MAX_FEATURE_STR	1024
