@@ -881,6 +881,36 @@ static int cu__fixup_btf_bitfields(const struct conf_load *conf, struct cu *cu)
 	return err;
 }
 
+/*
+ * libbpf guesses the pointer size of raw BTF from the size of a "long" integer
+ * type; for ELF files it uses the ELF class and split BTF inherits it from its
+ * base.  BTF without a "long" type, such as BTF from Rust objects, is left with
+ * an unknown (0) pointer size.  Fall back to the Rust pointer-sized integer
+ * types, then to the host pointer size as libbpf does internally, and tell
+ * libbpf so that its size calculations agree with ours.
+ */
+static uint8_t btf__determine_pointer_size(struct btf *btf)
+{
+	uint32_t id, nr_types = btf__type_cnt(btf);
+	size_t ptr_sz = btf__pointer_size(btf);
+
+	for (id = 1; !ptr_sz && id < nr_types; id++) {
+		const struct btf_type *t = btf__type_by_id(btf, id);
+		const char *name;
+
+		if (!btf_is_int(t) || (t->size != 4 && t->size != 8))
+			continue;
+		name = btf__name_by_offset(btf, t->name_off);
+		if (name && (strcmp(name, "usize") == 0 || strcmp(name, "isize") == 0))
+			ptr_sz = t->size;
+	}
+	if (!ptr_sz)
+		ptr_sz = sizeof(void *);
+
+	btf__set_pointer_size(btf, ptr_sz);
+	return ptr_sz;
+}
+
 static void btf__cu_delete(struct cu *cu)
 {
 	struct btf_inline_site *site, *n;
@@ -924,7 +954,7 @@ static int cus__load_btf(struct cus *cus, struct conf_load *conf, const char *fi
 
 	cu->priv = btf;
 	cu->little_endian = btf__endianness(btf) == BTF_LITTLE_ENDIAN;
-	cu->addr_size	  = btf__pointer_size(btf);
+	cu->addr_size	  = btf__determine_pointer_size(btf);
 
 	err = btf__load_sections(btf, cu);
 	if (err != 0)
