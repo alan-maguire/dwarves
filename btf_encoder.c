@@ -214,11 +214,19 @@ struct btf_encoder {
 	int                encode_vars;
 	struct btf_encoder_func_states func_states;
 	struct btf_encoder_func_states loc_states;
+	/* BTF type id ranges of types encoded from Rust CUs */
+	struct btf_id_range *rust_ranges;
+	uint32_t	  nr_rust_ranges;
 	/* This is a list of elf_functions tables, one per ELF.
 	 * Multiple ELF modules can be processed in one pahole run,
 	 * so we have to store elf_functions tables per ELF.
 	 */
 	struct list_head elf_functions_list;
+};
+
+struct btf_id_range {
+	uint32_t start;
+	uint32_t end;	/* inclusive */
 };
 
 static int btf_encoder__add_locsec(struct btf_encoder *encoder);
@@ -2571,6 +2579,579 @@ out:
 	return err;
 }
 
+/* Needed for older libbpf to support weak declaration of btf__new_empty_opts() */
+#ifndef btf_new_opts__last_field
+struct btf_new_opts {
+	size_t sz;
+	struct btf *base_btf;
+	bool add_layout;
+	size_t:0;
+};
+#endif
+
+/*
+ * Rust CUs in the kernel use bindgen-generated copies of C types; for
+ * example the kernel crate's bindings contain a "struct file" mirroring the
+ * C "struct file".  These copies have the same name, size and member layout
+ * as the C type, but differ in member names (__bindgen_anon_N for anonymous
+ * members, "type_" for C keywords), in leaf types (*mut c_void is a pointer
+ * to a Rust enum rather than to void, Rust integer types) and in how
+ * bitfields are represented (__BindgenBitfieldUnit).  As a result
+ * btf__dedup() cannot merge them with the C types, and we end up with
+ * multiple same-named structs/unions in BTF.
+ *
+ * Before dedup, find Rust structs/unions with a C counterpart of the same
+ * name and a compatible layout, redirect all references to the C type, and
+ * drop the Rust copy along with any Rust types that only it referenced
+ * (e.g. the "file__bindgen_ty_1" anonymous union types).
+ */
+
+struct btf_name_ref {
+	uint32_t name_off;
+	uint32_t id;
+	uint8_t  kind;		/* BTF_KIND_STRUCT or BTF_KIND_UNION */
+	bool	 is_fwd;
+};
+
+static int btf_name_ref__cmp(const void *a, const void *b)
+{
+	const struct btf_name_ref *x = a, *y = b;
+
+	if (x->name_off != y->name_off)
+		return x->name_off < y->name_off ? -1 : 1;
+	if (x->kind != y->kind)
+		return x->kind < y->kind ? -1 : 1;
+	/* prefer definitions over forward declarations */
+	if (x->is_fwd != y->is_fwd)
+		return x->is_fwd ? 1 : -1;
+	if (x->id != y->id)
+		return x->id < y->id ? -1 : 1;
+	return 0;
+}
+
+static int btf_name_off__cmp(const void *a, const void *b)
+{
+	uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+
+	return x < y ? -1 : x > y;
+}
+
+/* Call fn() for each type id field in t; -ENOTSUP for unknown kinds. */
+static int btf_type__visit_ids(struct btf_type *t, int (*fn)(uint32_t *id, void *ctx), void *ctx)
+{
+	uint16_t i, vlen = btf_vlen(t);
+	int err = 0;
+
+	switch (btf_kind(t)) {
+	case BTF_KIND_INT:
+	case BTF_KIND_FLOAT:
+	case BTF_KIND_ENUM:
+	case BTF_KIND_ENUM64:
+	case BTF_KIND_FWD:
+	case BTF_KIND_LOC_PARAM:
+		return 0;
+	case BTF_KIND_PTR:
+	case BTF_KIND_TYPEDEF:
+	case BTF_KIND_VOLATILE:
+	case BTF_KIND_CONST:
+	case BTF_KIND_RESTRICT:
+	case BTF_KIND_FUNC:
+	case BTF_KIND_VAR:
+	case BTF_KIND_DECL_TAG:
+	case BTF_KIND_TYPE_TAG:
+		return fn(&t->type, ctx);
+	case BTF_KIND_ARRAY: {
+		struct btf_array *a = btf_array(t);
+
+		err = fn(&a->type, ctx);
+		return err ?: fn(&a->index_type, ctx);
+	}
+	case BTF_KIND_STRUCT:
+	case BTF_KIND_UNION: {
+		struct btf_member *m = btf_members(t);
+
+		for (i = 0; i < vlen && !err; i++, m++)
+			err = fn(&m->type, ctx);
+		return err;
+	}
+	case BTF_KIND_FUNC_PROTO: {
+		struct btf_param *p = btf_params(t);
+
+		err = fn(&t->type, ctx);
+		for (i = 0; i < vlen && !err; i++, p++)
+			err = fn(&p->type, ctx);
+		return err;
+	}
+	case BTF_KIND_DATASEC: {
+		struct btf_var_secinfo *v = btf_var_secinfos(t);
+
+		for (i = 0; i < vlen && !err; i++, v++)
+			err = fn(&v->type, ctx);
+		return err;
+	}
+	case BTF_KIND_LOC_PROTO: {
+		uint32_t *ids = (uint32_t *)(t + 1);
+
+		for (i = 0; i < vlen && !err; i++)
+			err = fn(&ids[i], ctx);
+		return err;
+	}
+	case BTF_KIND_LOCSEC: {
+		struct btf_loc *l = (struct btf_loc *)(t + 1);
+
+		for (i = 0; i < vlen && !err; i++, l++) {
+			err = fn(&l->func, ctx);
+			if (!err)
+				err = fn(&l->loc_proto, ctx);
+		}
+		return err;
+	}
+	default:
+		return -ENOTSUP;
+	}
+}
+
+/* Bit range covered by a struct/union member. */
+struct btf_member_span {
+	uint64_t start;
+	uint64_t end;
+};
+
+/* Collect spans of members with non-zero size; returns count or < 0. */
+static int btf__member_spans(const struct btf *btf, const struct btf_type *t,
+			     struct btf_member_span **spansp)
+{
+	const struct btf_member *m = btf_members(t);
+	uint16_t i, vlen = btf_vlen(t);
+	struct btf_member_span *spans;
+	int cnt = 0;
+
+	spans = calloc(vlen ?: 1, sizeof(*spans));
+	if (!spans)
+		return -ENOMEM;
+
+	for (i = 0; i < vlen; i++, m++) {
+		uint64_t off = btf_member_bit_offset(t, i);
+		uint64_t sz = btf_member_bitfield_size(t, i);
+
+		if (!sz) {
+			long long bytes = btf__resolve_size(btf, m->type);
+
+			if (bytes < 0) {
+				free(spans);
+				return bytes;
+			}
+			sz = bytes * 8;
+		}
+		if (!sz)
+			continue;
+		spans[cnt++] = (struct btf_member_span){ .start = off, .end = off + sz };
+	}
+	*spansp = spans;
+	return cnt;
+}
+
+/*
+ * Check that the member boundaries of the Rust copy rt match those of the C
+ * type ct.  Member names and types are not compared as bindgen renames some
+ * members and uses different leaf types; only bit ranges are.  Zero-sized
+ * members (flexible arrays, bindgen alignment markers) are ignored.
+ *
+ * - each Rust member must start where a C member starts, unless it does not
+ *   overlap any C member (explicit bindgen padding for C alignment gaps);
+ * - a Rust member must not end in the middle of a C member that starts
+ *   within it;
+ * - each C member must lie within a Rust member; this allows C bitfields
+ *   to be grouped in a single bindgen bitfield unit;
+ * - for unions, each Rust member must also end where a C member ends.
+ */
+static bool btf__layout_matches(const struct btf *btf, const struct btf_type *rt,
+				const struct btf_type *ct)
+{
+	struct btf_member_span *rs = NULL, *cs = NULL;
+	bool is_union = btf_is_union(ct), ok = false;
+	int nr, nc, i, j;
+
+	if (rt->size != ct->size)
+		return false;
+
+	nr = btf__member_spans(btf, rt, &rs);
+	if (nr < 0)
+		return false;
+	nc = btf__member_spans(btf, ct, &cs);
+	if (nc < 0)
+		goto out;
+
+	for (i = 0; i < nr; i++) {
+		bool start_found = false, end_found = !is_union, overlaps = false;
+
+		for (j = 0; j < nc; j++) {
+			if (cs[j].start == rs[i].start)
+				start_found = true;
+			if (cs[j].end == rs[i].end)
+				end_found = true;
+			if (cs[j].start < rs[i].end && rs[i].start < cs[j].end)
+				overlaps = true;
+			if (rs[i].start < cs[j].start && cs[j].start < rs[i].end &&
+			    rs[i].end < cs[j].end)
+				goto out;
+		}
+		if (!overlaps)
+			continue;
+		if (!start_found || !end_found)
+			goto out;
+	}
+	for (j = 0; j < nc; j++) {
+		for (i = 0; i < nr; i++) {
+			if (rs[i].start <= cs[j].start && cs[j].end <= rs[i].end)
+				break;
+		}
+		if (i == nr)
+			goto out;
+	}
+	ok = true;
+out:
+	free(rs);
+	free(cs);
+	return ok;
+}
+
+/*
+ * bindgen represents C types only declared in the bound headers as opaque
+ * structs, either "struct foo { _unused: [u8; 0] }" (size 0) or
+ * "struct foo { _address: u8 }" (size 1).
+ */
+static bool btf__is_bindgen_opaque(const struct btf *btf, const struct btf_type *t)
+{
+	if (t->size == 0)
+		return true;
+	return t->size == 1 && btf_vlen(t) == 1 &&
+	       strcmp(btf__name_by_offset(btf, btf_members(t)->name_off), "_address") == 0;
+}
+
+/*
+ * bindgen represents some C unions as Rust structs with all members at
+ * offset 0: zero-sized __BindgenUnionField<T> members, one per C union
+ * member, and a "bindgen_union_field" array covering the whole union.
+ */
+static bool btf__is_union_like_struct(const struct btf_type *t)
+{
+	uint16_t i, vlen = btf_vlen(t);
+
+	if (!btf_is_struct(t) || vlen < 2)
+		return false;
+	for (i = 0; i < vlen; i++) {
+		if (btf_member_bit_offset(t, i))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Find a C type of the given kind to replace the Rust struct/union rt with;
+ * returns its id or 0 if none is found.  A bindgen opaque type is replaced by
+ * any same-named C definition or forward declaration; other types need a C
+ * definition with a matching layout.
+ */
+static uint32_t __btf__find_c_counterpart(const struct btf *btf, const struct btf_type *rt,
+					  uint8_t kind, const struct btf_name_ref *refs,
+					  size_t nr_refs)
+{
+	struct btf_name_ref key = { .name_off = rt->name_off, .kind = kind };
+	bool opaque = btf__is_bindgen_opaque(btf, rt);
+	const struct btf_name_ref *r;
+	size_t lo = 0, hi = nr_refs, mid;
+
+	/* lower bound of (name_off, kind) */
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		if (refs[mid].name_off < key.name_off ||
+		    (refs[mid].name_off == key.name_off && refs[mid].kind < key.kind))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+
+	for (r = &refs[lo]; r < refs + nr_refs; r++) {
+		if (r->name_off != key.name_off || r->kind != key.kind)
+			break;
+		if (opaque)
+			return r->id;
+		if (r->is_fwd)
+			break;
+		if (btf__layout_matches(btf, rt, btf__type_by_id(btf, r->id)))
+			return r->id;
+	}
+	return 0;
+}
+
+static uint32_t btf__find_c_counterpart(const struct btf *btf, const struct btf_type *rt,
+					const struct btf_name_ref *refs, size_t nr_refs)
+{
+	uint32_t id = __btf__find_c_counterpart(btf, rt, btf_kind(rt), refs, nr_refs);
+
+	if (!id && btf__is_union_like_struct(rt))
+		id = __btf__find_c_counterpart(btf, rt, BTF_KIND_UNION, refs, nr_refs);
+	return id;
+}
+
+static bool btf__has_c_name(const struct btf_type *rt, const struct btf_name_ref *refs,
+			    size_t nr_refs)
+{
+	struct btf_name_ref key = { .name_off = rt->name_off };
+	size_t lo = 0, hi = nr_refs, mid;
+
+	while (lo < hi) {
+		mid = lo + (hi - lo) / 2;
+		if (refs[mid].name_off < key.name_off)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < nr_refs && refs[lo].name_off == key.name_off;
+}
+
+struct btf_rust_replace {
+	uint32_t start_id;	/* first non-base id */
+	uint32_t *refcnt;	/* references to each non-base type */
+	uint32_t *map;		/* old id -> new id; 0 if removed */
+	uint32_t *stack;	/* types to be removed, whose references are to be dropped */
+	uint32_t nr_stack;
+	uint8_t  *flags;
+};
+
+#define BTF_RUST_TYPE		0x1
+#define BTF_RUST_REMOVED	0x2
+
+static int btf_rust_replace__ref(uint32_t *id, void *ctx)
+{
+	struct btf_rust_replace *rr = ctx;
+
+	if (*id >= rr->start_id)
+		rr->refcnt[*id - rr->start_id]++;
+	return 0;
+}
+
+static int btf_rust_replace__unref(uint32_t *id, void *ctx)
+{
+	struct btf_rust_replace *rr = ctx;
+	uint32_t idx = *id - rr->start_id;
+
+	if (*id < rr->start_id)
+		return 0;
+	if (--rr->refcnt[idx] == 0 && rr->flags[idx] == BTF_RUST_TYPE) {
+		rr->flags[idx] |= BTF_RUST_REMOVED;
+		rr->stack[rr->nr_stack++] = *id;
+	}
+	return 0;
+}
+
+static int btf_rust_replace__remap(uint32_t *id, void *ctx)
+{
+	struct btf_rust_replace *rr = ctx;
+
+	if (*id < rr->start_id)
+		return 0;
+	if (!rr->map[*id - rr->start_id])
+		return -ENOENT;
+	*id = rr->map[*id - rr->start_id];
+	return 0;
+}
+
+static int btf_encoder__replace_rust_bindgen_types(struct btf_encoder *encoder,
+						   struct conf_load *conf)
+{
+	struct btf *btf = encoder->btf, *base = (struct btf *)btf__base_btf(btf), *new_btf = NULL;
+	uint32_t i, id, n = btf__type_cnt(btf), start_id = base ? btf__type_cnt(base) : 1;
+	uint32_t nr = n - start_id, nr_names = 0, nr_replaced = 0, nr_removed = 0;
+	struct btf_rust_replace rr = { .start_id = start_id };
+	struct btf_name_ref *refs = NULL;
+	size_t nr_refs = 0, cap_refs = 0;
+	uint32_t *names = NULL;
+	int err = -ENOMEM;
+
+	if (!encoder->nr_rust_ranges)
+		return 0;
+
+	rr.flags = calloc(nr, sizeof(*rr.flags));
+	rr.refcnt = calloc(nr, sizeof(*rr.refcnt));
+	rr.map = calloc(nr, sizeof(*rr.map));
+	rr.stack = calloc(nr, sizeof(*rr.stack));
+	names = calloc(nr, sizeof(*names));
+	if (!rr.flags || !rr.refcnt || !rr.map || !rr.stack || !names)
+		goto out;
+
+	for (i = 0; i < encoder->nr_rust_ranges; i++) {
+		for (id = encoder->rust_ranges[i].start; id <= encoder->rust_ranges[i].end; id++)
+			rr.flags[id - start_id] = BTF_RUST_TYPE;
+	}
+
+	/* Names of Rust structs/unions, and references to all types */
+	for (id = start_id; id < n; id++) {
+		struct btf_type *t = (struct btf_type *)btf__type_by_id(btf, id);
+
+		if (rr.flags[id - start_id] && btf_is_composite(t) && t->name_off)
+			names[nr_names++] = t->name_off;
+		err = btf_type__visit_ids(t, btf_rust_replace__ref, &rr);
+		if (err) {
+			fprintf(stderr, "%s: unexpected BTF kind %u for [%u]\n", __func__,
+				btf_kind(t), id);
+			goto out;
+		}
+	}
+	qsort(names, nr_names, sizeof(*names), btf_name_off__cmp);
+
+	/* C structs/unions/fwds (base BTF included) sharing a name with a Rust one */
+	for (id = 1; id < n; id++) {
+		const struct btf_type *t = btf__type_by_id(btf, id);
+		struct btf_name_ref *tmp;
+
+		if (id >= start_id && rr.flags[id - start_id])
+			continue;
+		if (!t->name_off || !(btf_is_composite(t) || btf_is_fwd(t)))
+			continue;
+		if (!bsearch(&t->name_off, names, nr_names, sizeof(*names), btf_name_off__cmp))
+			continue;
+		if (nr_refs == cap_refs) {
+			cap_refs = cap_refs * 2 + 1024;
+			tmp = realloc(refs, cap_refs * sizeof(*refs));
+			if (!tmp) {
+				err = -ENOMEM;
+				goto out;
+			}
+			refs = tmp;
+		}
+		refs[nr_refs++] = (struct btf_name_ref){
+			.name_off = t->name_off,
+			.id = id,
+			.kind = !btf_is_fwd(t) ? btf_kind(t) :
+				btf_kflag(t) ? BTF_KIND_UNION : BTF_KIND_STRUCT,
+			.is_fwd = btf_is_fwd(t),
+		};
+	}
+	qsort(refs, nr_refs, sizeof(*refs), btf_name_ref__cmp);
+
+	/* Match Rust structs/unions to C ones; mark matches for removal */
+	for (id = start_id; id < n; id++) {
+		const struct btf_type *t = btf__type_by_id(btf, id);
+		uint32_t c_id;
+
+		if (!rr.flags[id - start_id] || !btf_is_composite(t) || !t->name_off)
+			continue;
+		c_id = btf__find_c_counterpart(btf, t, refs, nr_refs);
+		if (!c_id) {
+			if (encoder->verbose && btf__has_c_name(t, refs, nr_refs))
+				printf("BTF: Rust %s '%s' [%u] does not match C layout\n",
+				       btf_is_struct(t) ? "struct" : "union",
+				       btf__name_by_offset(btf, t->name_off), id);
+			continue;
+		}
+		rr.flags[id - start_id] |= BTF_RUST_REMOVED;
+		rr.map[id - start_id] = c_id;
+		rr.stack[rr.nr_stack++] = id;
+		nr_replaced++;
+		if (encoder->verbose)
+			printf("BTF: replacing Rust %s '%s' [%u] with C [%u]\n",
+			       btf_is_struct(t) ? "struct" : "union",
+			       btf__name_by_offset(btf, t->name_off), id, c_id);
+	}
+	if (!nr_replaced) {
+		err = 0;
+		goto out;
+	}
+
+	/* Rust decl tags' component_idx values do not apply to C types */
+	for (id = start_id; id < n; id++) {
+		const struct btf_type *t = btf__type_by_id(btf, id);
+
+		if (rr.flags[id - start_id] != BTF_RUST_TYPE || !btf_is_decl_tag(t) ||
+		    t->type < start_id || !(rr.flags[t->type - start_id] & BTF_RUST_REMOVED))
+			continue;
+		rr.flags[id - start_id] |= BTF_RUST_REMOVED;
+		rr.stack[rr.nr_stack++] = id;
+	}
+
+	/*
+	 * Drop references held by removed types; Rust types that were only
+	 * referenced by removed types are removed too.  Rust types that were
+	 * not referenced in the first place are kept.
+	 */
+	while (rr.nr_stack) {
+		struct btf_type *t;
+
+		id = rr.stack[--rr.nr_stack];
+		t = (struct btf_type *)btf__type_by_id(btf, id);
+		btf_type__visit_ids(t, btf_rust_replace__unref, &rr);
+		nr_removed++;
+	}
+
+	/* Assign new ids, then point replaced types at their C counterparts */
+	for (id = start_id, i = start_id; id < n; id++) {
+		if (!(rr.flags[id - start_id] & BTF_RUST_REMOVED))
+			rr.map[id - start_id] = i++;
+	}
+	for (id = start_id; id < n; id++) {
+		uint32_t c_id = rr.map[id - start_id];
+
+		if (!(rr.flags[id - start_id] & BTF_RUST_REMOVED) || !c_id)
+			continue;
+		rr.map[id - start_id] = c_id < start_id ? c_id : rr.map[c_id - start_id];
+	}
+
+	if (btf__new_empty_opts) {
+		LIBBPF_OPTS(btf_new_opts, opts);
+
+		opts.add_layout = !base && conf->btf_gen_layout;
+		opts.base_btf = base;
+		new_btf = btf__new_empty_opts(&opts);
+	} else {
+		new_btf = btf__new_empty_split(base);
+	}
+	if (!new_btf) {
+		err = -errno;
+		goto out;
+	}
+	btf__set_endianness(new_btf, btf__endianness(btf));
+	btf__set_pointer_size(new_btf, btf__pointer_size(btf));
+
+	for (id = start_id; id < n; id++) {
+		struct btf_type *t;
+		int new_id;
+
+		if (rr.flags[id - start_id] & BTF_RUST_REMOVED)
+			continue;
+		new_id = btf__add_type(new_btf, btf, btf__type_by_id(btf, id));
+		if (new_id < 0) {
+			err = new_id;
+			goto out;
+		}
+		t = (struct btf_type *)btf__type_by_id(new_btf, new_id);
+		err = btf_type__visit_ids(t, btf_rust_replace__remap, &rr);
+		if (err) {
+			fprintf(stderr, "%s: [%u] references a removed type\n", __func__, id);
+			goto out;
+		}
+	}
+
+	if (encoder->verbose)
+		printf("BTF: replaced %u Rust bindgen types with C types, removed %u Rust types\n",
+		       nr_replaced, nr_removed);
+
+	btf__free(encoder->btf);
+	encoder->btf = new_btf;
+	new_btf = NULL;
+	err = 0;
+out:
+	btf__free(new_btf);
+	free(refs);
+	free(names);
+	free(rr.flags);
+	free(rr.refcnt);
+	free(rr.map);
+	free(rr.stack);
+	return err;
+}
+
 int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 {
 	int err;
@@ -2592,6 +3173,12 @@ int btf_encoder__encode(struct btf_encoder *encoder, struct conf_load *conf)
 	/* Empty file, nothing to do, so... done! */
 	if (btf__type_cnt(encoder->btf) == 1)
 		return 0;
+
+	err = btf_encoder__replace_rust_bindgen_types(encoder, conf);
+	if (err) {
+		fprintf(stderr, "%s: failed to replace Rust bindgen types: %d\n", __func__, err);
+		return err;
+	}
 
 	if (btf__dedup(encoder->btf, NULL)) {
 		fprintf(stderr, "%s: btf__dedup failed!\n", __func__);
@@ -2988,16 +3575,6 @@ out:
 	return err;
 }
 
-/* Needed for older libbpf to support weak declaration of btf__new_empty_opts() */
-#ifndef btf_new_opts__last_field
-struct btf_new_opts {
-	size_t sz;
-	struct btf *base_btf;
-	bool add_layout;
-	size_t:0;
-};
-#endif
-
 struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filename, struct btf *base_btf, bool verbose, struct conf_load *conf_load)
 {
 	struct btf_encoder *encoder = zalloc(sizeof(*encoder));
@@ -3151,6 +3728,7 @@ void btf_encoder__delete(struct btf_encoder *encoder)
 	}
 	zfree(&encoder->filename);
 	zfree(&encoder->source_filename);
+	zfree(&encoder->rust_ranges);
 	btf__free(encoder->btf);
 	encoder->btf = NULL;
 
@@ -3514,6 +4092,27 @@ static int btf_encoder__precompute_btf_ids(struct btf_encoder *encoder, struct c
 	return 0;
 }
 
+static int btf_encoder__add_rust_range(struct btf_encoder *encoder, uint32_t start, uint32_t end)
+{
+	struct btf_id_range *ranges, *last;
+
+	if (start > end)
+		return 0;
+
+	last = encoder->nr_rust_ranges ? &encoder->rust_ranges[encoder->nr_rust_ranges - 1] : NULL;
+	if (last && last->end + 1 == start) {
+		last->end = end;
+		return 0;
+	}
+
+	ranges = realloc(encoder->rust_ranges, (encoder->nr_rust_ranges + 1) * sizeof(*ranges));
+	if (!ranges)
+		return -ENOMEM;
+	ranges[encoder->nr_rust_ranges++] = (struct btf_id_range){ .start = start, .end = end };
+	encoder->rust_ranges = ranges;
+	return 0;
+}
+
 int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct conf_load *conf_load)
 {
 	struct llvm_annotation *annot;
@@ -3744,6 +4343,10 @@ int btf_encoder__encode_cu(struct btf_encoder *encoder, struct cu *cu, struct co
 
 	if (encoder->encode_vars)
 		err = btf_encoder__encode_cu_variables(encoder);
+
+	if (!err && conf_load->rust_bindgen_replace && cu__is_rust(cu))
+		err = btf_encoder__add_rust_range(encoder, encoder->type_id_off + 1,
+						  btf__type_cnt(encoder->btf) - 1);
 
 	if (!err)
 		err = LSK__DELETE;
