@@ -2961,6 +2961,8 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		}
 		if (encoder->btf == NULL)
 			goto out_delete;
+		/* new BTF assumes the host pointer size; use the target's */
+		btf__set_pointer_size(encoder->btf, cu->addr_size);
 
 		encoder->force		 = conf_load->btf_encode_force;
 		encoder->gen_floats	 = conf_load->btf_gen_floats;
