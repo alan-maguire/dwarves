@@ -265,6 +265,7 @@ enum dwarf_languages {
     LANG_ObjC_plus_plus	= 0x11,	/* Objective-C++ */
     LANG_UPC		= 0x12,	/* Unified Parallel C */
     LANG_D		= 0x13,	/* D */
+    LANG_Rust		= 0x1c,	/* Rust */
 };
 
 /** struct debug_fmt_ops - specific to the underlying debug file format
@@ -376,6 +377,11 @@ static inline __pure bool cu__is_c_plus_plus(const struct cu *cu)
 static inline __pure bool cu__is_c(const struct cu *cu)
 {
 	return cu->language == LANG_C;
+}
+
+static inline __pure bool cu__is_rust(const struct cu *cu)
+{
+	return cu->language == LANG_Rust;
 }
 
 int lang__str2int(const char *lang);
