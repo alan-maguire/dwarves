@@ -365,6 +365,11 @@ Supported non-standard features (not enabled for 'default')
                            optimized functions.
 	layout             Encode information about BTF kinds available at encoding     
 	                   time in layout section in BTF.
+	rust_bindgen_replace
+	                   Replace Rust bindgen-generated copies of C structs
+	                   and unions with the C types they mirror when names
+	                   match and layouts are compatible, so that the copies
+	                   do not duplicate C types in the deduplicated BTF.
 
 Non-standard, non-BTF related features:
 
