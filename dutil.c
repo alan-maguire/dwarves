@@ -248,15 +248,43 @@ int exec_objcopy(const char *objcopy, const char *add_section,
 	struct sigaction ign, old_int, old_quit;
 	posix_spawnattr_t attr;
 	sigset_t child_default;
+	char *cmd, *word, *saveptr, **argv;
+	int argc = 0;
 	pid_t pid;
 	int rc;
 
-	char *argv[] = {
-		(char *)objcopy,
-		"--add-section", (char *)add_section,
-		"--", (char *)filename,
-		NULL
-	};
+	/*
+	 * objcopy may come from $LLVM_OBJCOPY or $OBJCOPY, which the kernel
+	 * build sets from its $(OBJCOPY) make variable, a command line that
+	 * can carry options, so split it into words on blanks, as the shell
+	 * did with system(), but without interpreting quotes or escapes.
+	 * A string of n characters has at most (n + 1) / 2 words.
+	 */
+	cmd = strdup(objcopy);
+	argv = calloc((strlen(objcopy) + 1) / 2 + 6, sizeof(*argv));
+	if (cmd == NULL || argv == NULL) {
+		rc = -1;
+		goto out_free;
+	}
+
+	for (word = strtok_r(cmd, " \t\n", &saveptr); word != NULL;
+	     word = strtok_r(NULL, " \t\n", &saveptr))
+		argv[argc++] = word;
+
+	if (argc == 0) {
+		rc = -ENOENT;
+		goto out_free;
+	}
+
+	argv[argc++] = "--add-section";
+	argv[argc++] = (char *)add_section;
+	/*
+	 * Name the output file too, so that a stray word in the command
+	 * makes objcopy fail instead of becoming its input file.
+	 */
+	argv[argc++] = "--";
+	argv[argc++] = (char *)filename;
+	argv[argc++] = (char *)filename;
 
 	/* Ignore SIGINT/SIGQUIT in parent while waiting, per POSIX system() */
 	ign.sa_handler = SIG_IGN;
@@ -278,14 +306,15 @@ int exec_objcopy(const char *objcopy, const char *add_section,
 	posix_spawnattr_setflags(&attr,
 				 POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK);
 
-	rc = posix_spawnp(&pid, objcopy, NULL, &attr, argv, environ);
+	rc = posix_spawnp(&pid, argv[0], NULL, &attr, argv, environ);
 	posix_spawnattr_destroy(&attr);
 
 	if (rc != 0) {
 		sigaction(SIGINT, &old_int, NULL);
 		sigaction(SIGQUIT, &old_quit, NULL);
 		pthread_sigmask(SIG_SETMASK, &orig, NULL);
-		return rc == ENOENT ? -ENOENT : -1;
+		rc = rc == ENOENT ? -ENOENT : -1;
+		goto out_free;
 	}
 
 	int status;
@@ -302,7 +331,11 @@ int exec_objcopy(const char *objcopy, const char *add_section,
 	pthread_sigmask(SIG_SETMASK, &orig, NULL);
 
 	if (status == -1 || !WIFEXITED(status))
-		return -1;
-
-	return WEXITSTATUS(status) == 0 ? 0 : -1;
+		rc = -1;
+	else
+		rc = WEXITSTATUS(status) == 0 ? 0 : -1;
+out_free:
+	free(argv);
+	free(cmd);
+	return rc;
 }
