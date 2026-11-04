@@ -14,6 +14,9 @@
 #   exists from the first encode.  pahole opens the ELF with ELF_C_RDWR,
 #   overwrites the Elf_Data buffer in place, and calls elf_update() --
 #   no objcopy needed.  This is the "Existing .BTF section found" path.
+#
+# Path 1 is run again with options in LLVM_OBJCOPY, as kernel builds up to
+# v6.19 pass their $(OBJCOPY) command line there.
 
 . "$(dirname "$0")/test_lib.sh"
 outdir=$(make_tmpdir)
@@ -114,5 +117,36 @@ if [ "$has_bpftool" -eq 1 ]; then
 	fi
 	info_log "BTF content valid after overwrite (elf_test found): ok"
 fi
+
+# --- Path 1 with options in LLVM_OBJCOPY ---
+# Kernel builds up to v6.19 run LLVM_OBJCOPY="${OBJCOPY}" pahole -J, and
+# $(OBJCOPY) is a command line that may carry options or trailing whitespace.
+# --preserve-dates keeps the old timestamp only if the option reaches objcopy.
+
+objcopy=${LLVM_OBJCOPY:-$OBJCOPY}
+if [ -z "$objcopy" ]; then
+	objcopy=objcopy
+	command -v llvm-objcopy > /dev/null 2>&1 && objcopy=llvm-objcopy
+fi
+args_obj="$outdir/write_elf_args_test.o"
+args_ref="$outdir/write_elf_args_test.ref"
+cp "$obj" "$args_obj"
+touch -t 200001010000 "$args_obj" "$args_ref"
+
+if ! LLVM_OBJCOPY="$objcopy --preserve-dates " pahole -J "$args_obj" 2>/dev/null; then
+	error_log "FAIL: pahole -J with options in LLVM_OBJCOPY failed (exit code != 0)"
+	test_fail
+fi
+
+if ! readelf -S "$args_obj" 2>/dev/null | grep -q '\.BTF[[:space:]]'; then
+	error_log "FAIL: .BTF section not found with options in LLVM_OBJCOPY"
+	test_fail
+fi
+
+if [ -n "$(find "$args_obj" -newer "$args_ref")" ]; then
+	error_log "FAIL: options in LLVM_OBJCOPY did not reach objcopy"
+	test_fail
+fi
+info_log "pahole -J with options in LLVM_OBJCOPY: ok"
 
 test_pass
