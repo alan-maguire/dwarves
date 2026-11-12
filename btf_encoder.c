@@ -1405,32 +1405,42 @@ static int32_t btf_encoder__save_func(struct btf_encoder *encoder, struct functi
 			break;
 		}
 	}
-	state->inconsistent_proto = ftype->inconsistent_proto;
-	state->unexpected_reg = ftype->unexpected_reg;
-	state->optimized_parms = ftype->optimized_parms;
-	state->uncertain_parm_loc = ftype->uncertain_parm_loc;
-	state->reordered_parm = ftype->reordered_parm;
-	state->signature_changed = ftype->signature_changed;
-	if (state->addr && func) {
-		for (int i = 0; i < func->sym_cnt; i++) {
-			if (state->addr != func->syms[i].addr)
-				continue;
-			if (str_contains_optimized_fn_suffix(func->syms[i].name)) {
-				state->optimized_symbol = 1;
-				break;
+	/*
+	 * A kfunc keeps the ABI of its C prototype, so avoid setting
+	 * state flags, otherwise the kfunc may be treated as
+	 * optimized and skipped, or lose parameters in BTF.  For other
+	 * cases, ensure the optimizations/uncertainties are reflected
+	 * in state flags.
+	 */
+	if (loc || !is_kfunc_state(state)) {
+		state->inconsistent_proto = ftype->inconsistent_proto;
+		state->unexpected_reg = ftype->unexpected_reg;
+		state->optimized_parms = ftype->optimized_parms;
+		state->uncertain_parm_loc = ftype->uncertain_parm_loc;
+		state->reordered_parm = ftype->reordered_parm;
+		state->signature_changed = ftype->signature_changed;
+		if (state->addr && func) {
+			for (int i = 0; i < func->sym_cnt; i++) {
+				if (state->addr != func->syms[i].addr)
+					continue;
+				if (str_contains_optimized_fn_suffix(func->syms[i].name)) {
+					state->optimized_symbol = 1;
+					break;
+				}
 			}
 		}
 	}
+
 	ftype__for_each_parameter(ftype, param) {
 		const char *name;
 		char *final_name = NULL;
 
 		/* No location info/optimized + reordered means optimized out. */
-		if (!loc && ftype->reordered_parm && (!param->has_loc || param->optimized)) {
+		if (!loc && state->reordered_parm && (!param->has_loc || param->optimized)) {
 			state->nr_parms--;
 			continue;
 		}
-		if (!loc && encoder->true_signature && ftype->signature_changed &&
+		if (!loc && encoder->true_signature && state->signature_changed &&
 		    param->optimized) {
 			state->nr_parms--;
 			continue;
@@ -1797,17 +1807,20 @@ static int btf_encoder__add_saved_funcs(struct btf_encoder *encoder, bool skip_e
 		 * signature; true_signature can rewrite those signatures.
 		 * Also exclude functions with unexpected register use, multiple
 		 * inconsistent prototypes or uncertain parameter locations.
+		 * The location based checks do not apply to kfuncs.
 		 */
-		if (state->unexpected_reg)
-			skip_reason = "unexpected register usage for parameter\n";
+		if (!is_kfunc_state(state)) {
+			if (state->unexpected_reg)
+				skip_reason = "unexpected register usage for parameter\n";
+			if (state->uncertain_parm_loc)
+				skip_reason = "uncertain parameter location\n";
+			if (state->reordered_parm)
+				skip_reason = "reordered parameters\n";
+			if (btf_encoder_func_state__skip_optimized_parms(encoder, canonical_state))
+				skip_reason = "optimized parameters\n";
+		}
 		if (skip_encoding_inconsistent_proto && state->inconsistent_proto)
 			skip_reason = "inconsistet prototype\n";
-		if (state->uncertain_parm_loc)
-			skip_reason = "uncertain parameter location\n";
-		if (state->reordered_parm)
-			skip_reason = "reordered parameters\n";
-		if (btf_encoder_func_state__skip_optimized_parms(encoder, canonical_state))
-			skip_reason = "optimized parameters\n";
 		if (state->elf->ambiguous_addr)
 			skip_reason = "ambiguous address\n";
 
@@ -3056,10 +3069,14 @@ struct btf_encoder *btf_encoder__new(struct cu *cu, const char *detached_filenam
 		if (!found_percpu && encoder->verbose)
 			printf("%s: '%s' doesn't have '%s' section\n", __func__, cu->filename, PERCPU_SECTION);
 
-		if (encoder->tag_kfuncs) {
-			if (btf_encoder__collect_kfuncs(encoder))
-				goto out_delete;
-		}
+		/*
+		 * Mark kfuncs before any function state is saved, so
+		 * btf_encoder__save_func() keeps their source prototypes.
+		 * Needed even without decl_tag_kfuncs, which only controls
+		 * the decl tags.
+		 */
+		if (btf_encoder__collect_kfuncs(encoder))
+			goto out_delete;
 
 		if (encoder->verbose)
 			printf("File %s:\n", cu->filename);
