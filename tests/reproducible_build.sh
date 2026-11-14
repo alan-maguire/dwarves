@@ -27,6 +27,16 @@ export PAHOLE_LANG_EXCLUDE=rust
 pahole --btf_features=default --btf_encode_detached=$outdir/vmlinux.btf.serial $vmlinux
 bpftool btf dump file $outdir/vmlinux.btf.serial > $outdir/bpftool.output.vmlinux.btf.serial
 
+# When CUs are merged (e.g. LTO kernels) pahole loads DWARF serially and
+# starts no loader threads whatever -j says; the encoding must still be
+# reproducible.
+if dwarf_cus_merged $vmlinux ; then
+	verbose_log "CUs are merged (LTO?); DWARF loading is serial, expecting no worker threads"
+	merged_cus=1
+else
+	merged_cus=0
+fi
+
 nr_proc=$(getconf _NPROCESSORS_ONLN)
 # Clamp to 1 so single-core machines don't produce -j0
 half_proc=$(( nr_proc / 2 > 0 ? nr_proc / 2 : 1 ))
@@ -43,8 +53,11 @@ for threads in $thread_list ; do
 	nr_threads_started=$(ls /proc/$pahole/task 2>/dev/null | wc -l)
 	nr_threads_started=$((nr_threads_started - 1)) # subtract main thread
 
-	if [ $threads != $nr_threads_started ] ; then
-		error_log "ERROR: pahole asked to start $threads encoding threads, started $nr_threads_started"
+	expected_threads=$threads
+	[ $merged_cus = 1 ] && expected_threads=0
+
+	if [ $expected_threads != $nr_threads_started ] ; then
+		error_log "ERROR: pahole asked to start $threads encoding threads, expected $expected_threads, started $nr_threads_started"
 		test_fail
 	fi
 
