@@ -18,11 +18,11 @@ export PAHOLE=${GITHUB_WORKSPACE}/install/usr/local/bin/pahole
 which pahole
 $PAHOLE --version
 
+# In CI, get-kernel-source.sh has already fetched the source.
 if [[ ! -d $REPO_TARGET ]]; then
-	git clone $REPO $REPO_TARGET
+	git clone --depth=1 --branch $REPO_BRANCH $REPO $REPO_TARGET
 fi
 cd $REPO_TARGET
-git checkout $REPO_BRANCH
 
 buildopts=
 if [[ "$CC" = "clang" ]]; then

@@ -55,10 +55,9 @@ jobs:
         run: .github/scripts/build-pahole.sh
 
       - name: Get kernel source
-        uses: libbpf/ci/get-linux-source@v3
-        with:
-          repo: 'https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git'
-          dest: '${{ github.workspace }}/.kernel'
+        shell: bash
+        timeout-minutes: 60
+        run: .github/scripts/get-kernel-source.sh
 
       - name: Configure, build kernel with current pahole
         shell: bash
