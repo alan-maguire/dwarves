@@ -55,35 +55,52 @@ pfunct --all --no_parm_names --format_path=dwarf $vmlinux | \
 pfunct --all --no_parm_names --format_path=btf $outdir/vmlinux.btf 2>/dev/null|\
 	awk '{ gsub("^(bpf_kfunc |bpf_fastcall )+",""); print $0}'|sort|uniq > $outdir/btf.funcs
 
-exact=0
-inline=0
-const_insensitive=0
+# Match BTF prototypes against DWARF prototypes with sorted set operations
+# (comm/join) rather than one grep of dwarf.funcs per BTF function; the
+# latter is O(BTF * DWARF) and becomes very slow on large (e.g. LTO) kernels.
+# Matching is on whole lines.  Use the C locale so sort, comm and join
+# agree on collation order.
+(
+export LC_ALL=C
+cd $outdir
+
+sort -u btf.funcs > btf.sorted
+sort -u dwarf.funcs > dwarf.sorted
+
+# 1. exact matches
+comm -12 btf.sorted dwarf.sorted > match.exact
+comm -23 btf.sorted dwarf.sorted > nomatch.exact
+
+# 2. function might be declared inline in DWARF.
+sed 's/^/inline /' nomatch.exact | sort > nomatch.exact.inline
+comm -12 nomatch.exact.inline dwarf.sorted > match.inline
+comm -23 nomatch.exact.inline dwarf.sorted | sed 's/^inline //' > nomatch.inline
+
+# 3. some functions have multiple instances in DWARF where one has
+# const param(s) and another does not (see errpos()).  We do not
+# mark these functions inconsistent as though they technically
+# have different prototypes, the data itself is not different.
+# Compare with "const " (and any DWARF "inline " prefix) removed;
+# keep "<noconst>\t<original>" pairs so mismatches are reported
+# with the original BTF prototype.
+sed -e 's/const //g' -e 's/^inline //' dwarf.sorted | sort -u > dwarf.noconst
+sed 's/const //g' nomatch.inline | paste - nomatch.inline | \
+	sort -t $'\t' -k1,1 > nomatch.inline.keyed
+cut -f1 nomatch.inline.keyed | sort -u | comm -23 - dwarf.noconst > nomatch.noconst
+join -t $'\t' nomatch.noconst nomatch.inline.keyed | cut -f2 > mismatches
+)
+
+exact=$(wc -l < $outdir/match.exact)
+inline=$(wc -l < $outdir/match.inline)
+const_insensitive=$(( $(wc -l < $outdir/nomatch.inline) - $(wc -l < $outdir/mismatches) ))
 
 while IFS= read -r btf ; do
-	# look for non-inline match first
-	dwarf=$(grep -F "$btf" $outdir/dwarf.funcs)
-	if [[ "$btf" != "$dwarf" ]]; then
-		# function might be declared inline in DWARF.
-		if [[ "inline $btf" != "$dwarf" ]]; then
-			# some functions have multiple instances in DWARF where one has
-			# const param(s) and another does not (see errpos()).  We do not
-			# mark these functions inconsistent as though they technically
-			# have different prototypes, the data itself is not different.
-			btf_noconst=$(echo $btf | awk '{gsub("const ",""); print $0 }')
-			dwarf_noconst=$(echo $dwarf | awk '{gsub("const ",""); print $0 }')
-			if [[ "$dwarf_noconst" =~ "$btf_noconst" ]]; then
-				const_insensitive=$((const_insensitive+1))
-			else
-				error_log "ERROR: mismatch : BTF '$btf' not found; DWARF '$dwarf'"
-				test_fail
-			fi
-		else
-			inline=$((inline+1))
-		fi
-	else
-		exact=$((exact+1))
-	fi
-done < $outdir/btf.funcs
+	# show DWARF prototypes for the same function name to aid debugging.
+	fn=$(echo "$btf" | sed -e 's/(.*//' -e 's/.*[ *]//')
+	dwarf=$(grep -F " $fn(" $outdir/dwarf.funcs; grep -F "*$fn(" $outdir/dwarf.funcs)
+	error_log "ERROR: mismatch : BTF '$btf' not found; DWARF '$dwarf'"
+	test_fail
+done < $outdir/mismatches
 
 verbose_log "Matched $exact functions exactly."
 verbose_log "Matched $inline functions with inlines."
