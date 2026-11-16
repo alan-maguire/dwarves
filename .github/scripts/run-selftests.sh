@@ -13,5 +13,5 @@ export LLVM_OBJCOPY=objcopy
 which pahole
 pahole --version
 bpftool --version
-vmlinux=$VMLINUX ./tests
+vmlinux=$VMLINUX ./tests ${SELFTEST_JOBS:+-j $SELFTEST_JOBS}
 
