@@ -74,6 +74,6 @@ jobs:
         shell: bash
         env:
           CC: ${{ inputs.cc }}
-          LLVM_VERSION: ${{ inputs.llvm_version }}
+          LLVM_VERSION: ${{ inputs.llvm-version }}
         run: .github/scripts/compare-functions.sh
 
