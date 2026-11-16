@@ -29,6 +29,13 @@ jobs:
             pahole: 'none'
             cc: 'clang'
           - kernel: 'LATEST'
+            runs_on: 'ubuntu-24.04'
+            arch: 'x86_64'
+            llvm-version: '22'
+            pahole: 'none'
+            cc: 'clang'
+            lto: 'thin'
+          - kernel: 'LATEST'
             runs_on: 'ubuntu-24.04-arm'
             arch: 'aarch64'
             llvm-version: '22'
@@ -49,3 +56,4 @@ jobs:
       llvm-version: ${{ matrix.llvm-version }}
       pahole: ${{ matrix.pahole }}
       cc: ${{ matrix.cc }}
+      lto: ${{ matrix.lto || 'none' }}
