@@ -31,10 +31,15 @@ on:
         description: 'compiler'
         required: true
         type: string
+      lto:
+        description: 'kernel LTO mode (none or thin; thin requires clang)'
+        required: false
+        default: 'none'
+        type: string
 
 jobs:
   vmtest:
-    name: pahole-${{ inputs.cc }}@${{ inputs.arch }}
+    name: pahole-${{ inputs.cc }}${{ inputs.lto != 'none' && format('-lto-{0}', inputs.lto) || '' }}@${{ inputs.arch }}
     runs-on: ${{ inputs.runs_on }}
     steps:
 
@@ -55,26 +60,29 @@ jobs:
         run: .github/scripts/build-pahole.sh
 
       - name: Get kernel source
-        uses: libbpf/ci/get-linux-source@v3
-        with:
-          repo: 'https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git'
-          dest: '${{ github.workspace }}/.kernel'
+        shell: bash
+        timeout-minutes: 60
+        run: .github/scripts/get-kernel-source.sh
 
       - name: Configure, build kernel with current pahole
         shell: bash
         env:
           CC: ${{ inputs.cc }}
           LLVM_VERSION: ${{ inputs.llvm-version }}
+          LTO: ${{ inputs.lto }}
         run: .github/scripts/build-kernel.sh
 
       - name: Run selftests
         shell: bash
+        env:
+          # ThinLTO vmlinux is large; limit how many tests load it at once.
+          SELFTEST_JOBS: ${{ inputs.lto != 'none' && '2' || '' }}
         run: .github/scripts/run-selftests.sh
 
       - name: Compare functions generated
         shell: bash
         env:
           CC: ${{ inputs.cc }}
-          LLVM_VERSION: ${{ inputs.llvm_version }}
+          LLVM_VERSION: ${{ inputs.llvm-version }}
         run: .github/scripts/compare-functions.sh
 

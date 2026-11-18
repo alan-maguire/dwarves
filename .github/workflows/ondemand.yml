@@ -18,10 +18,17 @@ on:
       runs-on:
         default: 'ubuntu-24.04'
         required: true
+      cc:
+        default: 'gcc'
+        required: true
+      lto:
+        description: 'kernel LTO mode (none or thin; thin requires cc=clang)'
+        default: 'none'
+        required: true
 
 jobs:
   vmtest:
-    name: ${{ inputs.kernel }} kernel llvm-${{ inputs.llvm-version }} pahole@${{ inputs.pahole }}
+    name: ${{ inputs.kernel }} kernel ${{ inputs.cc }} lto-${{ inputs.lto }} llvm-${{ inputs.llvm-version }} pahole@${{ inputs.pahole }}
     uses: ./.github/workflows/vmtest.yml
     with:
       runs_on: ${{ inputs.runs-on }}
@@ -29,3 +36,5 @@ jobs:
       arch: ${{ inputs.arch }}
       llvm-version: ${{ inputs.llvm-version }}
       pahole: ${{ inputs.pahole }}
+      cc: ${{ inputs.cc }}
+      lto: ${{ inputs.lto }}

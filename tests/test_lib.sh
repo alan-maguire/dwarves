@@ -464,6 +464,42 @@ get_perf_with_debug()
 	fi
 }
 
+# Return success if pahole's DWARF loader will merge all CUs of $1 into
+# one and load them serially rather than with -j worker threads.  This
+# mirrors cus__merging_cu() in dwarf_loader.c: the kernel's
+# LINUX_ELFNOTE_LTO_INFO note says it was built with LTO, or the DWARF
+# uses DW_FORM_ref_addr (references across CUs, as with clang LTO).
+#
+# readelf -n gives up on the kernel's .notes section (4-byte aligned
+# notes in an 8-byte aligned section), so walk the notes directly.
+dwarf_cus_merged()
+{
+	local obj=$1 notes
+
+	notes=$(mktemp)
+	if objcopy -O binary --only-section=.notes "$obj" "$notes" 2>/dev/null &&
+	   od -An -v -tu4 -w4 "$notes" | awk '
+		# namesz, descsz, type, name (padded to 4), desc (padded to 4)
+		{ w[n++] = $1 }
+		END {
+			for (i = 0; i + 3 <= n; ) {
+				namesz = w[i]; descsz = w[i+1]; type = w[i+2]
+				i += 3 + int((namesz + 3) / 4)
+				# LINUX_ELFNOTE_LTO_INFO, owner "Linux"
+				if (type == 257 && namesz == 6 && descsz == 4 && w[i] != 0)
+					exit 0
+				i += int((descsz + 3) / 4)
+			}
+			exit 1
+		}'; then
+		rm -f "$notes"
+		return 0
+	fi
+	rm -f "$notes"
+
+	readelf --debug-dump=abbrev "$obj" 2>/dev/null | grep -q DW_FORM_ref_addr
+}
+
 make_tmpdir()
 {
 	# Ensure master test directory exists
